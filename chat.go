@@ -309,33 +309,72 @@ func (c *Chat) IsPro() (bool, error) {
 
 // 加载默认模型
 func (c *Chat) loadModel() (string, error) {
-	o, err := c.getO()
-	if err != nil {
-		return "", err
-	}
+    o, err := c.getO()
+    if err != nil {
+        return "", err
+    }
 
-	response, err := emit.ClientBuilder(c.session).
-		GET(baseURL+"/bootstrap/"+o+"/statsig").
-		Ja3(ja3).
-		CookieJar(c.opts.jar).
-		Header("Origin", "https://claude.ai").
-		Header("Referer", "https://claude.ai/").
-		Header("Accept-Language", "en-US,en;q=0.9").
-		Header("user-agent", userAgent).
-		DoC(emit.Status(http.StatusOK), emit.IsJSON)
-	if err != nil {
-		return "", err
-	}
+    response, err := emit.ClientBuilder(c.session).
+        GET(baseURL+"/bootstrap/"+o+"/statsig").
+        Ja3().
+        CookieJar(c.opts.jar).
+        Header("Origin", "https://claude.ai").
+        Header("Referer", "https://claude.ai/").
+        Header("Accept-Language", "en-US,en;q=0.9").
+        Header("user-agent", userAgent).
+        DoC(emit.Status(http.StatusOK), emit.IsJSON)
+    if err != nil {
+        return "", err
+    }
 
-	defer response.Body.Close()
-	value := emit.TextResponse(response)
-	compileRegex := regexp.MustCompile(`"value":{"model":"(claude-[^"]+)"}`)
-	matchArr := compileRegex.FindStringSubmatch(value)
-	if len(matchArr) == 0 {
-		return "", errors.New("failed to fetch the conversation")
-	}
-
-	return matchArr[len(matchArr)-1], nil
+    defer response.Body.Close()
+    responseBody := emit.TextResponse(response)
+    
+    // First try to find models array using regex
+    modelsRegex := regexp.MustCompile(`"models":\[\{"model":"(claude-[^"]+)"`)
+    matchArr := modelsRegex.FindStringSubmatch(responseBody)
+    if len(matchArr) > 0 {
+        return matchArr[1], nil
+    }
+    
+    // If that fails, try parsing the JSON
+    var responseData map[string]interface{}
+    if err := json.Unmarshal([]byte(responseBody), &responseData); err == nil {
+        if statsig, ok := responseData["statsig"].(map[string]interface{}); ok {
+            if values, ok := statsig["values"].(map[string]interface{}); ok {
+                // Search for any value containing a models array
+                for _, v := range values {
+                    if valueObj, ok := v.(map[string]interface{}); ok {
+                        if valueValue, ok := valueObj["value"].(map[string]interface{}); ok {
+                            if models, ok := valueValue["models"].([]interface{}); ok && len(models) > 0 {
+                                if modelObj, ok := models[0].(map[string]interface{}); ok {
+                                    if modelName, ok := modelObj["model"].(string); ok {
+                                        return modelName, nil
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fall back to old regex as last resort
+    oldRegex := regexp.MustCompile(`"value":{"model":"(claude-[^"]+)"}`)
+    matchArr = oldRegex.FindStringSubmatch(responseBody)
+    if len(matchArr) > 0 {
+        return matchArr[1], nil
+    }
+    
+    // Try one more pattern as last resort
+    simpleRegex := regexp.MustCompile(`"model":"(claude-[^"]+)"`)
+    matchArr = simpleRegex.FindStringSubmatch(responseBody)
+    if len(matchArr) > 0 {
+        return matchArr[1], nil
+    }
+    
+    return "", errors.New("failed to fetch the model from the conversation")
 }
 
 func (c *Chat) getO() (string, error) {
