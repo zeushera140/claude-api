@@ -1,4 +1,4 @@
-module github.com/bincooo/claude-api
+module github.com/zeushera140/claude-api
 
 go 1.21.6
 
