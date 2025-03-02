@@ -54,7 +54,7 @@ func NewDefaultOptions(cookies string, model string, mode string) (*Options, err
     options := Options{
         Retry: 2,
         Model: model,
-        Mode:  mode, // Set the mode (can be "extended" or empty string for normal)
+        Mode:  mode, // Add mode parameter
     }
 
     if cookies != "" {
@@ -169,18 +169,18 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
         	payload["attachments"] = []any{}
     }
 
-	return emit.ClientBuilder(c.session).
-		Ja3().
-		CookieJar(c.opts.jar).
-		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
-		Header("referer", "https://claude.ai").
-		Header("accept", "text/event-stream").
-		Header("user-agent", userAgent).
-		JHeader().
-		Body(payload).
-		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+    // Fix the Ja3() call to not take parameters
+    	return emit.ClientBuilder(c.session).
+        Ja3().
+        CookieJar(c.opts.jar).
+        POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+        Header("referer", "https://claude.ai").
+        Header("accept", "text/event-stream").
+        Header("user-agent", userAgent).
+        JHeader().
+        Body(payload).
+        DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
 }
-
 func (c *Chat) Delete() {
 	if c.oid == "" {
 		return
