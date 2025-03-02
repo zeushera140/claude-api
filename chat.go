@@ -24,6 +24,13 @@ const (
 	userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 Edg/114.0.1823.79"
 )
 
+type Options struct {
+    Retry  int
+    Model  string
+    Mode   string // Add this new field
+    jar    http.CookieJar
+}
+
 type webClaude2Response struct {
 	Id           string `json:"id"`
 	Completion   string `json:"completion"`
@@ -43,25 +50,26 @@ func Ja3(j string) {
 	ja3 = j
 }
 
-func NewDefaultOptions(cookies string, model string) (*Options, error) {
-	options := Options{
-		Retry: 2,
-		Model: model,
-	}
+func NewDefaultOptions(cookies string, model string, mode string) (*Options, error) {
+    options := Options{
+        Retry: 2,
+        Model: model,
+        Mode:  mode, // Set the mode (can be "extended" or empty string for normal)
+    }
 
-	if cookies != "" {
-		if !strings.Contains(cookies, "sessionKey=") {
-			cookies = "sessionKey=" + cookies
-		}
+    if cookies != "" {
+        if !strings.Contains(cookies, "sessionKey=") {
+            cookies = "sessionKey=" + cookies
+        }
 
-		jar, err := emit.NewCookieJar("https://claude.ai", cookies)
-		if err != nil {
-			return nil, err
-		}
-		options.jar = jar
-	}
+        jar, err := emit.NewCookieJar("https://claude.ai", cookies)
+        if err != nil {
+            return nil, err
+        }
+        options.jar = jar
+    }
 
-	return &options, nil
+    return &options, nil
 }
 
 func New(opts *Options) (*Chat, error) {
@@ -143,17 +151,23 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 	}
 
 	payload := map[string]interface{}{
-		"rendering_mode": "raw",
-		"files":          make([]string, 0),
-		"timezone":       "America/New_York",
-		"model":          c.opts.Model,
-		"prompt":         message,
-	}
-	if len(attrs) > 0 {
-		payload["attachments"] = attrs
-	} else {
-		payload["attachments"] = []any{}
-	}
+        "rendering_mode": "raw",
+        "files":          make([]string, 0),
+        "timezone":       "America/New_York",
+        "model":          c.opts.Model,
+        "prompt":         message,
+    }
+    
+    // Add mode parameter if it's specified
+    	if c.opts.Mode != "" {
+        	payload["paprika_mode"] = c.opts.Mode
+    }
+    
+    	if len(attrs) > 0 {
+        	payload["attachments"] = attrs
+    } 	else {
+        	payload["attachments"] = []any{}
+    }
 
 	return emit.ClientBuilder(c.session).
 		Ja3().
