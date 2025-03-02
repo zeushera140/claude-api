@@ -25,12 +25,13 @@ type Attachment struct {
 }
 
 type Options struct {
-	Retry   int    // 重试次数
-	BotId   string // slack里的claude-id
-	Model   string // 提供两个模型：slack 、 web-claude-2
-	Proxies string // 本地代理
-	BaseURL string // 可代理转发
-	jar     http.CookieJar
+    Retry   int    // 重试次数
+    BotId   string // slack里的claude-id
+    Model   string // 提供两个模型：slack 、 web-claude-2
+    Mode    string // 思考模式: extended 或空
+    Proxies string // 本地代理
+    BaseURL string // 可代理转发
+    jar     http.CookieJar
 }
 
 type PartialResponse struct {
