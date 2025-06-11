@@ -216,6 +216,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 	)
 
 	scanner := bufio.NewScanner(r.Body)
+	logrus.Infof("Response Status: %s", r.Status)
 	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
 		if eof && len(data) == 0 {
 			return 0, nil, nil
@@ -244,6 +245,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 			return false
 		}
 		event = data[7:]
+		logrus.Infof("Event type: %s", event)
 
 		if !scanner.Scan() {
 			return true
@@ -257,11 +259,13 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		}
 
 		if event != "completion" {
-			return false
+    		logrus.Warnf("Non-completion event: %s, data: %s", event, string(dataBytes[6:]))
+    		return false  // Keep this for now
 		}
 
 		var response webClaude2Response
 		if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
+			logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
 			return false
 		}
 
@@ -269,6 +273,8 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 			Text:    response.Completion,
 			RawData: dataBytes[6:],
 		}
+
+		logrus.Infof("Parsed completion: %s, stop_reason: %s", response.Completion, response.StopReason)
 
 		return response.StopReason == "stop_sequence"
 	}
