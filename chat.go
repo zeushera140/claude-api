@@ -274,7 +274,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 			RawData: dataBytes[6:],
 		}
 
-		logrus.Infof("Parsed completion: %s, stop_reason: %s", response.Completion, response.StopReason)
+		//logrus.Infof("Parsed completion: %s, stop_reason: %s", response.Completion, response.StopReason)
 
 		return response.StopReason == "stop_sequence"
 	}
