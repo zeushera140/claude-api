@@ -179,7 +179,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		conversationId = cid
 	}
 
-	// 构建新的payload结构
+	// 构建payload - 兼容新旧格式
 	payload := map[string]interface{}{
 		"prompt":               message,
 		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
@@ -208,8 +208,8 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		},
 	}
 
-	// 关键：只有非Claude 4模型才需要model字段
-	if !strings.Contains(c.opts.Model, "claude-sonnet-4") && !strings.Contains(c.opts.Model, "claude-opus-4") {
+	// 只有特定模型才需要在completion请求中指定model
+	if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
 		payload["model"] = c.opts.Model
 	}
 
@@ -223,7 +223,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 	response, err := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
-		POST(baseURL+"/api/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
 		Header("referer", "https://claude.ai/chat/"+conversationId).
 		Header("accept", "text/event-stream").
 		Header("anthropic-client-platform", "web_claude_ai").
@@ -691,12 +691,15 @@ func (c *Chat) getC(o string) (string, error) {
 	}
 
 	if pro {
-		// 尊贵的pro
+		// 尊贵的pro - 所有模型都需要指定
 		payload["model"] = c.opts.Model
 	} else {
-		if strings.Contains(c.opts.Model, "opus") {
+		// 免费用户只能使用特定模型
+		if strings.Contains(c.opts.Model, "opus") || strings.Contains(c.opts.Model, "claude-sonnet-4") || strings.Contains(c.opts.Model, "claude-opus-4") {
 			return "", errors.New("failed to used pro model: " + c.opts.Model)
 		}
+		// 对于免费可用的模型，也需要指定
+		payload["model"] = c.opts.Model
 	}
 
 	response, err := emit.ClientBuilder(c.session).
@@ -709,22 +712,24 @@ func (c *Chat) getC(o string) (string, error) {
 		Header("Accept-Language", "en-US,en;q=0.9").
 		Header("user-agent", userAgent).
 		Body(payload).
-		DoC(emit.Status(http.StatusCreated), emit.IsJSON)
+		DoC(emit.Status(http.StatusOK), emit.IsJSON)
+
 	if err != nil {
 		return "", err
 	}
 
 	defer response.Body.Close()
-	result, err := emit.ToMap(response)
+	responseBody := emit.TextResponse(response)
+	logrus.Debugf("Create conversation response: %s", responseBody)
+
+	responseMap, err := emit.ToMap(response.Body)
 	if err != nil {
 		return "", err
 	}
 
-	if uid, ok := result["uuid"]; ok {
-		if u, okey := uid.(string); okey {
-			c.cid = u
-			return u, nil
-		}
+	if cid, ok := responseMap["uuid"]; ok && cid != "" {
+		c.cid = cid.(string)
+		return c.cid, nil
 	}
 
 	return "", errors.New("failed to fetch the conversation")
