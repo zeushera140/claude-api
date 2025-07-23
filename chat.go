@@ -127,9 +127,25 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
     		conversationId string
     	)
     
-    	// 获取组织ID和会话ID的代码保持不变...
-    	
-    	// 最简化的payload
+    	// 获取组织ID
+    	{
+    		oid, err := c.getO()
+    		if err != nil {
+    			return nil, fmt.Errorf("fetch organization failed: %v", err)
+    		}
+    		organizationId = oid
+    	}
+    
+    	// 获取会话ID
+    	{
+    		cid, err := c.getC(organizationId)
+    		if err != nil {
+    			return nil, fmt.Errorf("fetch conversation failed: %v", err)
+    		}
+    		conversationId = cid
+    	}
+    
+    	// 构造新的payload格式
     	payload := map[string]interface{}{
     		"prompt": message,
     		"model":  c.opts.Model,
