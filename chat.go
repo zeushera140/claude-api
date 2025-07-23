@@ -145,31 +145,56 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		conversationId = cid
 	}
 
-	// 最简化的payload，先不加任何可选参数
+	// 使用新的payload格式
 	payload := map[string]interface{}{
-		"prompt": message,
-		"model":  c.opts.Model,
+		"prompt":         message,
+		"timezone":       "America/New_York", // 或者使用 Asia/Shanghai
+		"locale":         "en-US",
+		"rendering_mode": "messages", // 关键：改为"messages"
+		"attachments":    []interface{}{},
+		"files":          []interface{}{},
+		"sync_sources":   []interface{}{},
+		"personalized_styles": []interface{}{
+			map[string]interface{}{
+				"type":        "default",
+				"key":         "Default", 
+				"name":        "Normal",
+				"nameKey":     "normal_style_name",
+				"prompt":      "Normal",
+				"summary":     "Default responses from Claude",
+				"summaryKey":  "normal_style_summary",
+				"isDefault":   true,
+			},
+		},
+		"tools": []interface{}{
+			map[string]interface{}{"type": "web_search_v0", "name": "web_search"},
+			map[string]interface{}{"type": "artifacts_v0", "name": "artifacts"},
+			map[string]interface{}{"type": "repl_v0", "name": "repl"},
+		},
 	}
-	
+
+	// 添加attachments
 	if len(attrs) > 0 {
 		payload["attachments"] = attrs
 	}
 
-	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
+	logrus.Infof("发送请求 - payload: %+v", payload)
 
+	// 修改API路径，添加/api前缀和新header
 	response, err := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
-		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+		POST(baseURL+"/api/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion"). // 添加/api
 		Header("referer", "https://claude.ai").
 		Header("accept", "text/event-stream").
+		Header("anthropic-client-platform", "web_claude_ai"). // 新增关键header
 		Header("user-agent", userAgent).
 		JHeader().
 		Body(payload).
 		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
 
 	if err != nil {
-		logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
+		logrus.Errorf("请求失败 - 错误: %v", err)
 	}
 
 	return response, err
@@ -199,139 +224,149 @@ func (c *Chat) Delete() {
 	}
 }
 
-	func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan PartialResponse) {
-    	defer c.mu.Unlock()
-    	defer close(message)
-    	defer r.Body.Close()
-    
-    	if c.session != nil {
-    		defer func() {
-    			c.session.IdleClose()
-    		}()
-    	}
-    
-    	var (
-    		prefix1 = "event: "
-    		prefix2 = []byte("data: ")
-    	)
-    
-    	scanner := bufio.NewScanner(r.Body)
-    	logrus.Infof("Response Status: %s", r.Status)
-    	logrus.Infof("Response Headers: %v", r.Header)
-    	
-    	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
-    		if eof && len(data) == 0 {
-    			return 0, nil, nil
-    		}
-    		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-    			return i + 1, data[0:i], nil
-    		}
-    		if eof {
-    			return len(data), data, nil
-    		}
-    		return 0, nil, nil
-    	})
-    
-    	var eventCount int
-    	var lastDataReceived time.Time = time.Now()
-    
-    	// return true 结束轮询
-    	handler := func() bool {
-    		if !scanner.Scan() {
-    			logrus.Warnf("Scanner stopped. Events processed: %d", eventCount)
-    			return true
-    		}
-    
-    		var event string
-    		data := scanner.Text()
-    		
-    		// 记录所有原始数据
-    		if strings.TrimSpace(data) != "" {
-    			logrus.Infof("Raw line %d: %s", eventCount, data)
-    			lastDataReceived = time.Now()
-    		}
-    
-    		if len(data) < 7 || data[:7] != prefix1 {
-    			// 可能是数据行或其他格式，继续处理
-    			if strings.HasPrefix(data, "data: ") {
-    				// 直接处理数据行
-    				dataContent := data[6:]
-    				logrus.Infof("Direct data line: %s", dataContent)
-    				
-    				// 尝试解析JSON
-    				if err := c.parseAndSendResponse(dataContent, message); err != nil {
-    					logrus.Errorf("Failed to parse direct data: %v", err)
-    				}
-    			}
-    			return false
-    		}
-    		
-    		event = data[7:]
-    		logrus.Infof("Event type: %s", event)
-    		eventCount++
-    
-    		if !scanner.Scan() {
-    			logrus.Warn("No data line after event")
-    			return true
-    		}
-    
-    		dataBytes := scanner.Bytes()
-    		logrus.Infof("Data bytes length: %d", len(dataBytes))
-    		
-    		if len(dataBytes) > 0 {
-    			logrus.Infof("Raw data: %s", string(dataBytes))
-    		}
-    		
-    		if len(dataBytes) < 6 || !bytes.HasPrefix(dataBytes, prefix2) {
-    			logrus.Warnf("Data line doesn't start with 'data: '. Line: %s", string(dataBytes))
-    			return false
-    		}
-    
-    		dataContent := string(dataBytes[6:])
-    		logrus.Infof("Processing event '%s' with data: %s", event, dataContent)
-    
-    		// 不再严格限制事件类型，尝试解析所有包含内容的事件
-    		if event == "completion" || event == "content_block_delta" || event == "message_delta" || strings.Contains(event, "delta") {
-    			if err := c.parseAndSendResponse(dataContent, message); err != nil {
-    				logrus.Errorf("Failed to parse %s event: %v", event, err)
-    				return false
-    			}
-    		} else {
-    			logrus.Warnf("Unknown event type: %s, data: %s", event, dataContent)
-    			// 尝试解析是否包含completion内容
-    			if err := c.parseAndSendResponse(dataContent, message); err != nil {
-    				logrus.Debugf("Data doesn't contain completion: %v", err)
-    			}
-    		}
-    
-    		return false // 继续处理更多事件
-    	}
-    
-    	// 添加超时检测
-    	ticker := time.NewTicker(30 * time.Second)
-    	defer ticker.Stop()
-    
-    	for {
-    		select {
-    		case <-ctx.Done():
-    			logrus.Warn("Context cancelled")
-    			message <- PartialResponse{
-    				Error: errors.New("resolve timeout"),
-    			}
-    			return
-    		case <-ticker.C:
-    			if time.Since(lastDataReceived) > 45*time.Second {
-    				logrus.Warn("No data received for 45 seconds, ending stream")
-    				return
-    			}
-    		default:
-    			if handler() {
-    				logrus.Infof("Handler returned true, ending stream. Total events: %d", eventCount)
-    				return
-    			}
-    		}
-    	}
-    }
+	// 添加新的响应结构体
+type ContentBlockDelta struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+}
+
+type NewClaudeResponse struct {
+	Type        string             `json:"type"`
+	Index       int               `json:"index,omitempty"`
+	Delta       *ContentBlockDelta `json:"delta,omitempty"`
+	Message     interface{}       `json:"message,omitempty"`
+	ContentBlock interface{}      `json:"content_block,omitempty"`
+}
+
+func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan PartialResponse) {
+	defer c.mu.Unlock()
+	defer close(message)
+	defer r.Body.Close()
+
+	if c.session != nil {
+		defer func() {
+			c.session.IdleClose()
+		}()
+	}
+
+	var (
+		prefix1 = "event: "
+		prefix2 = []byte("data: ")
+	)
+
+	scanner := bufio.NewScanner(r.Body)
+	logrus.Infof("Response Status: %s", r.Status)
+	logrus.Infof("Response Headers: %+v", r.Header)
+	
+	eventCount := 0
+
+	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
+		if eof && len(data) == 0 {
+			return 0, nil, nil
+		}
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			return i + 1, data[0:i], nil
+		}
+		if eof {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
+	})
+
+	handler := func() bool {
+		if !scanner.Scan() {
+			logrus.Warnf("Scanner stopped. Events processed: %d", eventCount)
+			return true
+		}
+
+		var event string
+		data := scanner.Text()
+		logrus.Trace("--------- ORIGINAL MESSAGE ---------")
+		logrus.Trace(data)
+
+		if len(data) < 7 || data[:7] != prefix1 {
+			logrus.Debugf("Skipping non-event line: %s", data)
+			return false
+		}
+		event = data[7:]
+		logrus.Infof("Event type: %s", event)
+
+		if !scanner.Scan() {
+			logrus.Warn("Failed to read data line after event")
+			return true
+		}
+
+		dataBytes := scanner.Bytes()
+		logrus.Trace("--------- ORIGINAL MESSAGE ---------")
+		logrus.Trace(string(dataBytes))
+		if len(dataBytes) < 6 || !bytes.HasPrefix(dataBytes, prefix2) {
+			logrus.Debugf("Invalid data format: %s", string(dataBytes))
+			return false
+		}
+
+		eventCount++
+
+		// 处理新的事件格式
+		switch event {
+		case "message_start":
+			logrus.Info("Message started")
+			return false
+			
+		case "content_block_start":
+			logrus.Info("Content block started")
+			return false
+			
+		case "content_block_delta":
+			var response NewClaudeResponse
+			if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
+				logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
+				return false
+			}
+
+			var text string
+			if response.Delta != nil {
+				if response.Delta.Text != "" {
+					text = response.Delta.Text
+				} else if response.Delta.Thinking != "" {
+					text = response.Delta.Thinking // 可选：显示思考过程
+				}
+			}
+
+			if text != "" {
+				message <- PartialResponse{
+					Text:    text,
+					RawData: dataBytes[6:],
+				}
+			}
+			return false
+			
+		case "content_block_stop", "message_stop":
+			logrus.Info("Content/Message stopped")
+			return true
+			
+		default:
+			logrus.Warnf("Unknown event type: %s, data: %s", event, string(dataBytes[6:]))
+			return false
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Warnf("Context timeout. Events processed: %d", eventCount)
+			message <- PartialResponse{
+				Error: errors.New("resolve timeout"),
+			}
+			return
+		default:
+			if handler() {
+				logrus.Infof("Handler returned true, ending stream. Total events: %d", eventCount)
+				return
+			}
+		}
+	}
+}
     
     // 解析响应并发送消息的辅助函数
     func (c *Chat) parseAndSendResponse(dataContent string, message chan PartialResponse) error {
