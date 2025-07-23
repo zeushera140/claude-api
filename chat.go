@@ -712,24 +712,23 @@ func (c *Chat) getC(o string) (string, error) {
 		Header("Accept-Language", "en-US,en;q=0.9").
 		Header("user-agent", userAgent).
 		Body(payload).
-		DoC(emit.Status(http.StatusOK), emit.IsJSON)
+		DoC(emit.Status(http.StatusCreated), emit.IsJSON)
 
 	if err != nil {
 		return "", err
 	}
 
 	defer response.Body.Close()
-	responseBody := emit.TextResponse(response)
-	logrus.Debugf("Create conversation response: %s", responseBody)
-
-	responseMap, err := emit.ToMap(response.Body)
+	result, err := emit.ToMap(response)  // 修正：直接传response，不是response.Body
 	if err != nil {
 		return "", err
 	}
 
-	if cid, ok := responseMap["uuid"]; ok && cid != "" {
-		c.cid = cid.(string)
-		return c.cid, nil
+	if uid, ok := result["uuid"]; ok {
+		if u, okey := uid.(string); okey {
+			c.cid = u
+			return u, nil
+		}
 	}
 
 	return "", errors.New("failed to fetch the conversation")
