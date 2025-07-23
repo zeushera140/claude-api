@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"io"  // 添加这个
 	"time"  // 添加这个
 	"fmt"   // 添加这个
 	"bufio"
