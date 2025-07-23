@@ -123,64 +123,58 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 }
 
 func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
-    	var (
-    		organizationId string
-    		conversationId string
-    	)
-    
-    	// 获取组织ID
-    	{
-    		oid, err := c.getO()
-    		if err != nil {
-    			return nil, fmt.Errorf("fetch organization failed: %v", err)
-    		}
-    		organizationId = oid
-    	}
-    
-    	// 获取会话ID
-    	{
-    		cid, err := c.getC(organizationId)
-    		if err != nil {
-    			return nil, fmt.Errorf("fetch conversation failed: %v", err)
-    		}
-    		conversationId = cid
-    	}
-    
-    	// 构造新的payload格式
-    	payload := map[string]interface{}{
-    		"prompt": message,
-    		"model":  c.opts.Model,
-    	}
-    	
-    	if len(attrs) > 0 {
-    		payload["attachments"] = attrs
-    	}
-    
-    	logrus.Infof("发送最简payload - 模型: %s, payload: %+v", c.opts.Model, payload)
-    
-    	response, err := emit.ClientBuilder(c.session).
-    		Ja3().
-    		CookieJar(c.opts.jar).
-    		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
-    		Header("referer", "https://claude.ai").
-    		Header("accept", "text/event-stream").
-    		Header("user-agent", userAgent).
-    		JHeader().
-    		Body(payload).
-    		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
-    
-    	if err != nil {
-    		logrus.Errorf("请求详细错误 - HTTP状态: %v", err)
-    		
-    		// 尝试获取更多错误信息
-    		if httpErr, ok := err.(*http.Response); ok {
-    			body, _ := io.ReadAll(httpErr.Body)
-    			logrus.Errorf("响应体: %s", string(body))
-    		}
-    	}
-    
-    	return response, err
-    }
+	var (
+		organizationId string
+		conversationId string
+	)
+
+	// 获取组织ID
+	{
+		oid, err := c.getO()
+		if err != nil {
+			return nil, fmt.Errorf("fetch organization failed: %v", err)
+		}
+		organizationId = oid
+	}
+
+	// 获取会话ID
+	{
+		cid, err := c.getC(organizationId)
+		if err != nil {
+			return nil, fmt.Errorf("fetch conversation failed: %v", err)
+		}
+		conversationId = cid
+	}
+
+	// 最简化的payload，先不加任何可选参数
+	payload := map[string]interface{}{
+		"prompt": message,
+		"model":  c.opts.Model,
+	}
+	
+	if len(attrs) > 0 {
+		payload["attachments"] = attrs
+	}
+
+	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
+
+	response, err := emit.ClientBuilder(c.session).
+		Ja3().
+		CookieJar(c.opts.jar).
+		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+		Header("referer", "https://claude.ai").
+		Header("accept", "text/event-stream").
+		Header("user-agent", userAgent).
+		JHeader().
+		Body(payload).
+		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+
+	if err != nil {
+		logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
+	}
+
+	return response, err
+}
 
 func (c *Chat) Delete() {
 	if c.oid == "" {
