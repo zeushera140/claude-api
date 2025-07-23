@@ -26,6 +26,7 @@ const (
 )
 
 
+// 原有的旧API响应结构体
 type webClaude2Response struct {
 	Id           string `json:"id"`
 	Completion   string `json:"completion"`
@@ -35,14 +36,107 @@ type webClaude2Response struct {
 	Truncated    bool   `json:"truncated"`
 	Stop         string `json:"stop"`
 	LogId        string `json:"log_id"`
-	Exception    any    `json:"exception"`
+	Exception    string `json:"exception"`
 	MessageLimit struct {
 		Type string `json:"type"`
-	} `json:"messageLimit"`
+	} `json:"message_limit"`
+}
+
+// 新API的响应结构体
+type ClaudeMessage struct {
+	ID           string        `json:"id"`
+	Type         string        `json:"type"`
+	Role         string        `json:"role"`
+	Model        string        `json:"model"`
+	ParentUUID   string        `json:"parent_uuid"`
+	UUID         string        `json:"uuid"`
+	Content      []interface{} `json:"content"`
+	StopReason   interface{}   `json:"stop_reason"`
+	StopSequence interface{}   `json:"stop_sequence"`
+}
+
+type MessageStartEvent struct {
+	Type    string        `json:"type"`
+	Message ClaudeMessage `json:"message"`
+}
+
+type ContentBlock struct {
+	StartTimestamp string        `json:"start_timestamp"`
+	StopTimestamp  interface{}   `json:"stop_timestamp"`
+	Type           string        `json:"type"`
+	Thinking       string        `json:"thinking"`
+	Text           string        `json:"text"`
+	Summaries      []interface{} `json:"summaries"`
+	CutOff         bool          `json:"cut_off"`
+}
+
+type ContentBlockStartEvent struct {
+	Type         string       `json:"type"`
+	Index        int          `json:"index"`
+	ContentBlock ContentBlock `json:"content_block"`
+}
+
+type ContentBlockDelta struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+}
+
+type ContentBlockDeltaEvent struct {
+	Type  string            `json:"type"`
+	Index int               `json:"index"`
+	Delta ContentBlockDelta `json:"delta"`
+}
+
+type ContentBlockStopEvent struct {
+	Type  string `json:"type"`
+	Index int    `json:"index"`
+}
+
+type MessageStopEvent struct {
+	Type string `json:"type"`
 }
 
 func Ja3(j string) {
 	ja3 = j
+}
+
+// 保持原有的Options结构体不变
+type Options struct {
+	Retry int
+	Model string
+	Mode  string // paprika mode for Claude 3.x models
+	jar   *http.CookieJar
+}
+
+// 修改Chat结构体，添加parentMessageUUID字段
+type Chat struct {
+	opts              *Options
+	session           *emit.Session
+	oid               string
+	cid               string
+	mu                sync.Mutex
+	parentMessageUUID string // 新增：用于存储上一条消息的UUID
+}
+
+// 保持原有的PartialResponse结构体不变
+type PartialResponse struct {
+	Text    string
+	RawData []byte
+	Error   error
+}
+
+// 保持原有的Attachment结构体不变  
+type Attachment struct {
+	Content     string `json:"extracted_content"`
+	FileName    string `json:"file_name"`
+	FileSize    int    `json:"file_size"`
+	FileType    string `json:"file_type"`
+	TotalPages  int    `json:"total_pages,omitempty"`
+	URL         string `json:"url,omitempty"`
+	ID          string `json:"id,omitempty"`
+	CreatedAt   string `json:"created_at,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
 }
 
 func NewDefaultOptions(cookies string, model string, mode string) (*Options, error) {
@@ -145,59 +239,129 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		conversationId = cid
 	}
 
-	// 使用新的payload格式
-	payload := map[string]interface{}{
-		"prompt":         message,
-		"timezone":       "America/New_York", // 或者使用 Asia/Shanghai
-		"locale":         "en-US",
-		"rendering_mode": "messages", // 关键：改为"messages"
-		"attachments":    []interface{}{},
-		"files":          []interface{}{},
-		"sync_sources":   []interface{}{},
-		"personalized_styles": []interface{}{
-			map[string]interface{}{
-				"type":        "default",
-				"key":         "Default", 
-				"name":        "Normal",
-				"nameKey":     "normal_style_name",
-				"prompt":      "Normal",
-				"summary":     "Default responses from Claude",
-				"summaryKey":  "normal_style_summary",
-				"isDefault":   true,
+	// 检测模型类型，决定使用哪种API
+	isNewAPI := c.isNewAPIModel(c.opts.Model)
+	
+	var payload map[string]interface{}
+	var apiPath string
+	
+	if isNewAPI {
+		// Claude 4 及新模型使用新API格式
+		apiPath = baseURL + "/api/organizations/" + organizationId + "/chat_conversations/" + conversationId + "/completion"
+		
+		payload = map[string]interface{}{
+			"prompt":              message,
+			"parent_message_uuid": c.getParentMessageUUID(), // 获取或生成parent_message_uuid
+			"timezone":            "Asia/Shanghai", // 使用实际的时区
+			"personalized_styles": []map[string]interface{}{
+				{
+					"type":       "default",
+					"key":        "Default", 
+					"name":       "Normal",
+					"nameKey":    "normal_style_name",
+					"prompt":     "Normal",
+					"summary":    "Default responses from Claude",
+					"summaryKey": "normal_style_summary",
+					"isDefault":  true,
+				},
 			},
-		},
-		"tools": []interface{}{
-			map[string]interface{}{"type": "web_search_v0", "name": "web_search"},
-			map[string]interface{}{"type": "artifacts_v0", "name": "artifacts"},
-			map[string]interface{}{"type": "repl_v0", "name": "repl"},
-		},
+			"locale": "en-US",
+			"tools": []map[string]interface{}{
+				{"type": "web_search_v0", "name": "web_search"},
+				{"type": "artifacts_v0", "name": "artifacts"},
+				{"type": "repl_v0", "name": "repl"},
+			},
+			"attachments":    []interface{}{},
+			"files":          []interface{}{},
+			"sync_sources":   []interface{}{},
+			"rendering_mode": "messages",
+		}
+		
+		if len(attrs) > 0 {
+			payload["attachments"] = attrs
+		}
+		
+	} else {
+		// Claude 3.x 等旧模型使用旧API格式
+		apiPath = baseURL + "/organizations/" + organizationId + "/chat_conversations/" + conversationId + "/completion"
+		
+		payload = map[string]interface{}{
+			"rendering_mode": "raw",
+			"files":          make([]string, 0),
+			"timezone":       "America/New_York",
+			"model":          c.opts.Model,
+			"prompt":         message,
+		}
+		
+		// 添加mode参数
+		if c.opts.Mode != "" {
+			payload["paprika_mode"] = c.opts.Mode
+		}
+		
+		if len(attrs) > 0 {
+			payload["attachments"] = attrs
+		} else {
+			payload["attachments"] = []any{}
+		}
 	}
 
-	// 添加attachments
-	if len(attrs) > 0 {
-		payload["attachments"] = attrs
-	}
+	logrus.Infof("发送请求 - 模型: %s, API类型: %s, payload: %+v", c.opts.Model, 
+		map[bool]string{true: "新API", false: "旧API"}[isNewAPI], payload)
 
-	logrus.Infof("发送请求 - payload: %+v", payload)
-
-	// 修改API路径，添加/api前缀和新header
-	response, err := emit.ClientBuilder(c.session).
+	// 构建请求，根据API类型添加不同的headers
+	requestBuilder := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
-		POST(baseURL+"/api/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion"). // 添加/api
-		Header("referer", "https://claude.ai").
+		POST(apiPath).
+		Header("referer", "https://claude.ai/chat/"+conversationId).
 		Header("accept", "text/event-stream").
-		Header("anthropic-client-platform", "web_claude_ai"). // 新增关键header
 		Header("user-agent", userAgent).
+		Header("origin", "https://claude.ai").
 		JHeader().
-		Body(payload).
-		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+		Body(payload)
+	
+	// 新API需要额外的headers
+	if isNewAPI {
+		requestBuilder = requestBuilder.
+			Header("anthropic-client-platform", "web_claude_ai").
+			Header("sec-fetch-dest", "empty").
+			Header("sec-fetch-mode", "cors").
+			Header("sec-fetch-site", "same-origin")
+	}
+
+	response, err := requestBuilder.DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
 
 	if err != nil {
-		logrus.Errorf("请求失败 - 错误: %v", err)
+		logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
 	}
 
 	return response, err
+}
+
+// 判断是否为新API模型
+func (c *Chat) isNewAPIModel(model string) bool {
+	newAPIModels := []string{
+		"claude-sonnet-4",
+		"claude-opus-4", 
+		"claude-4",
+	}
+	
+	for _, newModel := range newAPIModels {
+		if strings.Contains(model, newModel) {
+			return true
+		}
+	}
+	return false
+}
+
+// 获取或生成parent_message_uuid
+func (c *Chat) getParentMessageUUID() string {
+	// 对于新对话，使用固定的UUID
+	// 在实际实现中，这应该是上一条消息的UUID
+	if c.parentMessageUUID == "" {
+		c.parentMessageUUID = "00000000-0000-4000-8000-000000000000"
+	}
+	return c.parentMessageUUID
 }
 
 func (c *Chat) Delete() {
@@ -260,7 +424,8 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 	logrus.Infof("Response Headers: %+v", r.Header)
 	
 	eventCount := 0
-
+	isNewAPI := c.isNewAPIModel(c.opts.Model)
+	
 	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
 		if eof && len(data) == 0 {
 			return 0, nil, nil
@@ -274,6 +439,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		return 0, nil, nil
 	})
 
+	// return true 结束轮询
 	handler := func() bool {
 		if !scanner.Scan() {
 			logrus.Warnf("Scanner stopped. Events processed: %d", eventCount)
@@ -307,47 +473,12 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 
 		eventCount++
 
-		// 处理新的事件格式
-		switch event {
-		case "message_start":
-			logrus.Info("Message started")
-			return false
-			
-		case "content_block_start":
-			logrus.Info("Content block started")
-			return false
-			
-		case "content_block_delta":
-			var response NewClaudeResponse
-			if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
-				logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
-				return false
-			}
-
-			var text string
-			if response.Delta != nil {
-				if response.Delta.Text != "" {
-					text = response.Delta.Text
-				} else if response.Delta.Thinking != "" {
-					text = response.Delta.Thinking // 可选：显示思考过程
-				}
-			}
-
-			if text != "" {
-				message <- PartialResponse{
-					Text:    text,
-					RawData: dataBytes[6:],
-				}
-			}
-			return false
-			
-		case "content_block_stop", "message_stop":
-			logrus.Info("Content/Message stopped")
-			return true
-			
-		default:
-			logrus.Warnf("Unknown event type: %s, data: %s", event, string(dataBytes[6:]))
-			return false
+		if isNewAPI {
+			// 处理新API事件格式（Claude 4）
+			return c.handleNewAPIEvent(event, dataBytes[6:], message)
+		} else {
+			// 处理旧API事件格式（Claude 3.x）
+			return c.handleOldAPIEvent(event, dataBytes[6:], message)
 		}
 	}
 
@@ -365,6 +496,133 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 				return
 			}
 		}
+	}
+}
+
+// 处理新API事件（Claude 4）
+func (c *Chat) handleNewAPIEvent(event string, data []byte, message chan PartialResponse) bool {
+	switch event {
+	case "message_start":
+		var msgStart MessageStartEvent
+		if err := json.Unmarshal(data, &msgStart); err != nil {
+			logrus.Errorf("Failed to parse message_start: %v", err)
+			return false
+		}
+		logrus.Infof("Message started: %s", msgStart.Message.UUID)
+		// 保存消息UUID用于后续请求
+		c.parentMessageUUID = msgStart.Message.UUID
+		return false
+
+	case "content_block_start":
+		var blockStart ContentBlockStartEvent
+		if err := json.Unmarshal(data, &blockStart); err != nil {
+			logrus.Errorf("Failed to parse content_block_start: %v", err)
+			return false
+		}
+		logrus.Infof("Content block started: type=%s, index=%d", blockStart.ContentBlock.Type, blockStart.Index)
+		return false
+
+	case "content_block_delta":
+		var blockDelta ContentBlockDeltaEvent
+		if err := json.Unmarshal(data, &blockDelta); err != nil {
+			logrus.Errorf("Failed to parse content_block_delta: %v", err)
+			return false
+		}
+		
+		// 发送内容增量
+		var content string
+		if blockDelta.Delta.Text != "" {
+			content = blockDelta.Delta.Text
+		} else if blockDelta.Delta.Thinking != "" {
+			content = blockDelta.Delta.Thinking
+		}
+		
+		if content != "" {
+			message <- PartialResponse{
+				Text:    content,
+				RawData: data,
+			}
+		}
+		return false
+
+	case "content_block_stop":
+		var blockStop ContentBlockStopEvent
+		if err := json.Unmarshal(data, &blockStop); err != nil {
+			logrus.Errorf("Failed to parse content_block_stop: %v", err)
+			return false
+		}
+		logrus.Infof("Content block stopped: index=%d", blockStop.Index)
+		return false
+
+	case "message_stop":
+		var msgStop MessageStopEvent
+		if err := json.Unmarshal(data, &msgStop); err != nil {
+			logrus.Errorf("Failed to parse message_stop: %v", err)
+			return false
+		}
+		logrus.Info("Message completed")
+		return true
+
+	case "ping":
+		logrus.Debug("Received ping event")
+		return false
+
+	case "error":
+		logrus.Errorf("Received error event: %s", string(data))
+		message <- PartialResponse{
+			Error: fmt.Errorf("server error: %s", string(data)),
+		}
+		return true
+
+	default:
+		logrus.Warnf("Unknown new API event type: %s, data: %s", event, string(data))
+		return false
+	}
+}
+
+// 处理旧API事件（Claude 3.x）
+func (c *Chat) handleOldAPIEvent(event string, data []byte, message chan PartialResponse) bool {
+	switch event {
+	case "completion":
+		var response webClaude2Response
+		if err := json.Unmarshal(data, &response); err != nil {
+			logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(data))
+			return false
+		}
+
+		message <- PartialResponse{
+			Text:    response.Completion,
+			RawData: data,
+		}
+
+		return response.StopReason == "stop_sequence"
+
+	case "ping":
+		logrus.Debug("Received ping event")
+		return false
+
+	case "error":
+		logrus.Errorf("Received error event: %s", string(data))
+		message <- PartialResponse{
+			Error: fmt.Errorf("server error: %s", string(data)),
+		}
+		return true
+
+	default:
+		logrus.Warnf("Unknown old API event type: %s, data: %s", event, string(data))
+		
+		// 尝试解析为completion格式
+		var response webClaude2Response
+		if err := json.Unmarshal(data, &response); err == nil && response.Completion != "" {
+			logrus.Infof("Successfully parsed unknown event as completion")
+			message <- PartialResponse{
+				Text:    response.Completion,
+				RawData: data,
+			}
+			return response.StopReason == "stop_sequence"
+		}
+		
+		return false
 	}
 }
     
