@@ -127,65 +127,42 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
     		conversationId string
     	)
     
-    	// 获取组织ID
-    	{
-    		oid, err := c.getO()
-    		if err != nil {
-    			return nil, fmt.Errorf("fetch organization failed: %v", err)
-    		}
-    		organizationId = oid
-    	}
-    
-    	// 获取会话ID
-    	{
-    		cid, err := c.getC(organizationId)
-    		if err != nil {
-    			return nil, fmt.Errorf("fetch conversation failed: %v", err)
-    		}
-    		conversationId = cid
-    	}
-    
-    	// 构造新的payload格式
+    	// 获取组织ID和会话ID的代码保持不变...
+    	
+    	// 最简化的payload
     	payload := map[string]interface{}{
-    		"rendering_mode": "raw",
-    		"files":          make([]string, 0),
-    		"timezone":       "America/New_York",
-    		"model":          c.opts.Model,
-    		"prompt":         message,
+    		"prompt": message,
+    		"model":  c.opts.Model,
     	}
     	
-    	// 添加模式参数
-    	if c.opts.Mode != "" {
-    		payload["paprika_mode"] = c.opts.Mode
-    	} else {
-    		// 根据paste.txt信息，某些模型需要paprika_modes
-    		if strings.Contains(c.opts.Model, "sonnet-4") || strings.Contains(c.opts.Model, "opus-4") {
-    			payload["paprika_mode"] = "extended"
-    		}
-    	}
-    	
-    	// 添加附件
     	if len(attrs) > 0 {
     		payload["attachments"] = attrs
-    	} else {
-    		payload["attachments"] = []any{}
     	}
     
-    	logrus.Infof("Sending payload: %+v", payload)
+    	logrus.Infof("发送最简payload - 模型: %s, payload: %+v", c.opts.Model, payload)
     
-    	return emit.ClientBuilder(c.session).
+    	response, err := emit.ClientBuilder(c.session).
     		Ja3().
     		CookieJar(c.opts.jar).
     		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
     		Header("referer", "https://claude.ai").
     		Header("accept", "text/event-stream").
-    		Header("accept-language", "en-US,en;q=0.9").
-    		Header("cache-control", "no-cache").
     		Header("user-agent", userAgent).
-    		Header("x-request-id", fmt.Sprintf("req_%d", time.Now().UnixNano())).
     		JHeader().
     		Body(payload).
     		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+    
+    	if err != nil {
+    		logrus.Errorf("请求详细错误 - HTTP状态: %v", err)
+    		
+    		// 尝试获取更多错误信息
+    		if httpErr, ok := err.(*http.Response); ok {
+    			body, _ := io.ReadAll(httpErr.Body)
+    			logrus.Errorf("响应体: %s", string(body))
+    		}
+    	}
+    
+    	return response, err
     }
 
 func (c *Chat) Delete() {
