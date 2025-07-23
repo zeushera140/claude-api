@@ -1,6 +1,8 @@
 package claude
 
 import (
+	"time"  // 添加这个
+	"fmt"   // 添加这个
 	"bufio"
 	"bytes"
 	"context"
@@ -121,60 +123,72 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 }
 
 func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
-	var (
-		organizationId string
-		conversationId string
-	)
-
-	// 获取组织ID
-	{
-		oid, err := c.getO()
-		if err != nil {
-			return nil, fmt.Errorf("fetch organization failed: %v", err)
-		}
-		organizationId = oid
-	}
-
-	// 获取会话ID
-	{
-		cid, err := c.getC(organizationId)
-		if err != nil {
-			return nil, fmt.Errorf("fetch conversation failed: %v", err)
-		}
-		conversationId = cid
-	}
-
-	payload := map[string]interface{}{
-        "rendering_mode": "raw",
-        "files":          make([]string, 0),
-        "timezone":       "America/New_York",
-        "model":          c.opts.Model,
-        "prompt":         message,
-    }
+    	var (
+    		organizationId string
+    		conversationId string
+    	)
     
-    // Add mode parameter if it's specified
+    	// 获取组织ID
+    	{
+    		oid, err := c.getO()
+    		if err != nil {
+    			return nil, fmt.Errorf("fetch organization failed: %v", err)
+    		}
+    		organizationId = oid
+    	}
+    
+    	// 获取会话ID
+    	{
+    		cid, err := c.getC(organizationId)
+    		if err != nil {
+    			return nil, fmt.Errorf("fetch conversation failed: %v", err)
+    		}
+    		conversationId = cid
+    	}
+    
+    	// 构造新的payload格式
+    	payload := map[string]interface{}{
+    		"rendering_mode": "raw",
+    		"files":          make([]string, 0),
+    		"timezone":       "America/New_York",
+    		"model":          c.opts.Model,
+    		"prompt":         message,
+    	}
+    	
+    	// 添加模式参数
     	if c.opts.Mode != "" {
-        	payload["paprika_mode"] = c.opts.Mode
-    }
-    
+    		payload["paprika_mode"] = c.opts.Mode
+    	} else {
+    		// 根据paste.txt信息，某些模型需要paprika_modes
+    		if strings.Contains(c.opts.Model, "sonnet-4") || strings.Contains(c.opts.Model, "opus-4") {
+    			payload["paprika_mode"] = "extended"
+    		}
+    	}
+    	
+    	// 添加附件
     	if len(attrs) > 0 {
-        	payload["attachments"] = attrs
-    } 	else {
-        	payload["attachments"] = []any{}
+    		payload["attachments"] = attrs
+    	} else {
+    		payload["attachments"] = []any{}
+    	}
+    
+    	logrus.Infof("Sending payload: %+v", payload)
+    
+    	return emit.ClientBuilder(c.session).
+    		Ja3().
+    		CookieJar(c.opts.jar).
+    		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+    		Header("referer", "https://claude.ai").
+    		Header("accept", "text/event-stream").
+    		Header("accept-language", "en-US,en;q=0.9").
+    		Header("cache-control", "no-cache").
+    		Header("user-agent", userAgent).
+    		Header("x-request-id", fmt.Sprintf("req_%d", time.Now().UnixNano())).
+    		JHeader().
+    		Body(payload).
+    		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
     }
 
-    // Fix the Ja3() call to not take parameters
-    	return emit.ClientBuilder(c.session).
-        Ja3().
-        CookieJar(c.opts.jar).
-        POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
-        Header("referer", "https://claude.ai").
-        Header("accept", "text/event-stream").
-        Header("user-agent", userAgent).
-        JHeader().
-        Body(payload).
-        DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
-}
 func (c *Chat) Delete() {
 	if c.oid == "" {
 		return
@@ -199,100 +213,237 @@ func (c *Chat) Delete() {
 	}
 }
 
-func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan PartialResponse) {
-	defer c.mu.Unlock()
-	defer close(message)
-	defer r.Body.Close()
-
-	if c.session != nil {
-		defer func() {
-			c.session.IdleClose()
-		}()
-	}
-
-	var (
-		prefix1 = "event: "
-		prefix2 = []byte("data: ")
-	)
-
-	scanner := bufio.NewScanner(r.Body)
-	logrus.Infof("Response Status: %s", r.Status)
-	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
-		if eof && len(data) == 0 {
-			return 0, nil, nil
-		}
-		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			return i + 1, data[0:i], nil
-		}
-		if eof {
-			return len(data), data, nil
-		}
-		return 0, nil, nil
-	})
-
-	// return true 结束轮询
-	handler := func() bool {
-		if !scanner.Scan() {
-			return true
-		}
-
-		var event string
-		data := scanner.Text()
-		logrus.Trace("--------- ORIGINAL MESSAGE ---------")
-		logrus.Trace(data)
-
-		if len(data) < 7 || data[:7] != prefix1 {
-			return false
-		}
-		event = data[7:]
-		logrus.Infof("Event type: %s", event)
-
-		if !scanner.Scan() {
-			return true
-		}
-
-		dataBytes := scanner.Bytes()
-		logrus.Trace("--------- ORIGINAL MESSAGE ---------")
-		logrus.Trace(string(dataBytes))
-		if len(dataBytes) < 6 || !bytes.HasPrefix(dataBytes, prefix2) {
-			return false
-		}
-
-		if event != "completion" {
-    		logrus.Warnf("Non-completion event: %s, data: %s", event, string(dataBytes[6:]))
-    		return false  // Keep this for now
-		}
-
-		var response webClaude2Response
-		if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
-			logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
-			return false
-		}
-
-		message <- PartialResponse{
-			Text:    response.Completion,
-			RawData: dataBytes[6:],
-		}
-
-		//logrus.Infof("Parsed completion: %s, stop_reason: %s", response.Completion, response.StopReason)
-
-		return response.StopReason == "stop_sequence"
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			message <- PartialResponse{
-				Error: errors.New("resolve timeout"),
-			}
-			return
-		default:
-			if handler() {
-				return
-			}
-		}
-	}
-}
+	func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan PartialResponse) {
+    	defer c.mu.Unlock()
+    	defer close(message)
+    	defer r.Body.Close()
+    
+    	if c.session != nil {
+    		defer func() {
+    			c.session.IdleClose()
+    		}()
+    	}
+    
+    	var (
+    		prefix1 = "event: "
+    		prefix2 = []byte("data: ")
+    	)
+    
+    	scanner := bufio.NewScanner(r.Body)
+    	logrus.Infof("Response Status: %s", r.Status)
+    	logrus.Infof("Response Headers: %v", r.Header)
+    	
+    	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
+    		if eof && len(data) == 0 {
+    			return 0, nil, nil
+    		}
+    		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+    			return i + 1, data[0:i], nil
+    		}
+    		if eof {
+    			return len(data), data, nil
+    		}
+    		return 0, nil, nil
+    	})
+    
+    	var eventCount int
+    	var lastDataReceived time.Time = time.Now()
+    
+    	// return true 结束轮询
+    	handler := func() bool {
+    		if !scanner.Scan() {
+    			logrus.Warnf("Scanner stopped. Events processed: %d", eventCount)
+    			return true
+    		}
+    
+    		var event string
+    		data := scanner.Text()
+    		
+    		// 记录所有原始数据
+    		if strings.TrimSpace(data) != "" {
+    			logrus.Infof("Raw line %d: %s", eventCount, data)
+    			lastDataReceived = time.Now()
+    		}
+    
+    		if len(data) < 7 || data[:7] != prefix1 {
+    			// 可能是数据行或其他格式，继续处理
+    			if strings.HasPrefix(data, "data: ") {
+    				// 直接处理数据行
+    				dataContent := data[6:]
+    				logrus.Infof("Direct data line: %s", dataContent)
+    				
+    				// 尝试解析JSON
+    				if err := c.parseAndSendResponse(dataContent, message); err != nil {
+    					logrus.Errorf("Failed to parse direct data: %v", err)
+    				}
+    			}
+    			return false
+    		}
+    		
+    		event = data[7:]
+    		logrus.Infof("Event type: %s", event)
+    		eventCount++
+    
+    		if !scanner.Scan() {
+    			logrus.Warn("No data line after event")
+    			return true
+    		}
+    
+    		dataBytes := scanner.Bytes()
+    		logrus.Infof("Data bytes length: %d", len(dataBytes))
+    		
+    		if len(dataBytes) > 0 {
+    			logrus.Infof("Raw data: %s", string(dataBytes))
+    		}
+    		
+    		if len(dataBytes) < 6 || !bytes.HasPrefix(dataBytes, prefix2) {
+    			logrus.Warnf("Data line doesn't start with 'data: '. Line: %s", string(dataBytes))
+    			return false
+    		}
+    
+    		dataContent := string(dataBytes[6:])
+    		logrus.Infof("Processing event '%s' with data: %s", event, dataContent)
+    
+    		// 不再严格限制事件类型，尝试解析所有包含内容的事件
+    		if event == "completion" || event == "content_block_delta" || event == "message_delta" || strings.Contains(event, "delta") {
+    			if err := c.parseAndSendResponse(dataContent, message); err != nil {
+    				logrus.Errorf("Failed to parse %s event: %v", event, err)
+    				return false
+    			}
+    		} else {
+    			logrus.Warnf("Unknown event type: %s, data: %s", event, dataContent)
+    			// 尝试解析是否包含completion内容
+    			if err := c.parseAndSendResponse(dataContent, message); err != nil {
+    				logrus.Debugf("Data doesn't contain completion: %v", err)
+    			}
+    		}
+    
+    		return false // 继续处理更多事件
+    	}
+    
+    	// 添加超时检测
+    	ticker := time.NewTicker(30 * time.Second)
+    	defer ticker.Stop()
+    
+    	for {
+    		select {
+    		case <-ctx.Done():
+    			logrus.Warn("Context cancelled")
+    			message <- PartialResponse{
+    				Error: errors.New("resolve timeout"),
+    			}
+    			return
+    		case <-ticker.C:
+    			if time.Since(lastDataReceived) > 45*time.Second {
+    				logrus.Warn("No data received for 45 seconds, ending stream")
+    				return
+    			}
+    		default:
+    			if handler() {
+    				logrus.Infof("Handler returned true, ending stream. Total events: %d", eventCount)
+    				return
+    			}
+    		}
+    	}
+    }
+    
+    // 解析响应并发送消息的辅助函数
+    func (c *Chat) parseAndSendResponse(dataContent string, message chan PartialResponse) error {
+    	if strings.TrimSpace(dataContent) == "" || dataContent == "[DONE]" {
+    		return nil
+    	}
+    
+    	// 尝试解析为原始webClaude2Response格式
+    	var response webClaude2Response
+    	if err := json.Unmarshal([]byte(dataContent), &response); err == nil && response.Completion != "" {
+    		logrus.Infof("Parsed webClaude2Response: completion='%s', stop_reason='%s'", response.Completion, response.StopReason)
+    		message <- PartialResponse{
+    			Text:    response.Completion,
+    			RawData: []byte(dataContent),
+    		}
+    		return nil
+    	}
+    
+    	// 尝试解析为新的流式格式（类似OpenAI）
+    	var streamResponse struct {
+    		Type   string `json:"type"`
+    		Index  int    `json:"index"`
+    		Delta  struct {
+    			Type string `json:"type"`
+    			Text string `json:"text"`
+    		} `json:"delta"`
+    		ContentBlock struct {
+    			Type string `json:"type"`
+    			Text string `json:"text"`
+    		} `json:"content_block"`
+    	}
+    	
+    	if err := json.Unmarshal([]byte(dataContent), &streamResponse); err == nil {
+    		text := ""
+    		if streamResponse.Delta.Text != "" {
+    			text = streamResponse.Delta.Text
+    		} else if streamResponse.ContentBlock.Text != "" {
+    			text = streamResponse.ContentBlock.Text
+    		}
+    		
+    		if text != "" {
+    			logrus.Infof("Parsed stream response: text='%s'", text)
+    			message <- PartialResponse{
+    				Text:    text,
+    				RawData: []byte(dataContent),
+    			}
+    			return nil
+    		}
+    	}
+    
+    	// 尝试解析其他可能的格式
+    	var genericResponse map[string]interface{}
+    	if err := json.Unmarshal([]byte(dataContent), &genericResponse); err == nil {
+    		logrus.Infof("Generic response keys: %v", getKeys(genericResponse))
+    		
+    		// 寻找可能包含文本内容的字段
+    		possibleTextFields := []string{"completion", "text", "content", "message"}
+    		for _, field := range possibleTextFields {
+    			if value, exists := genericResponse[field]; exists {
+    				if textValue, ok := value.(string); ok && textValue != "" {
+    					logrus.Infof("Found text in field '%s': %s", field, textValue)
+    					message <- PartialResponse{
+    						Text:    textValue,
+    						RawData: []byte(dataContent),
+    					}
+    					return nil
+    				}
+    			}
+    		}
+    		
+    		// 检查嵌套的delta或content字段
+    		if delta, exists := genericResponse["delta"]; exists {
+    			if deltaMap, ok := delta.(map[string]interface{}); ok {
+    				if text, exists := deltaMap["text"]; exists {
+    					if textValue, ok := text.(string); ok && textValue != "" {
+    						logrus.Infof("Found text in delta.text: %s", textValue)
+    						message <- PartialResponse{
+    							Text:    textValue,
+    							RawData: []byte(dataContent),
+    						}
+    						return nil
+    					}
+    				}
+    			}
+    		}
+    	}
+    
+    	return fmt.Errorf("unable to parse response: %s", dataContent)
+    }
+    
+    // 获取map的所有key
+    func getKeys(m map[string]interface{}) []string {
+    	keys := make([]string, 0, len(m))
+    	for k := range m {
+    		keys = append(keys, k)
+    	}
+    	return keys
+    }
 
 // 加载默认模型
 func (c *Chat) IsPro() (bool, error) {
