@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/bincooo/emit.io"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
