@@ -675,61 +675,64 @@ func (c *Chat) getO() (string, error) {
 	return "", errors.New("failed to fetch the organization")
 }
 
+// 在chat.go文件中修改getC函数
 func (c *Chat) getC(o string) (string, error) {
-	if c.cid != "" {
-		return c.cid, nil
-	}
+    if c.cid != "" {
+        return c.cid, nil
+    }
 
-	payload := map[string]interface{}{
-		"name": "",
-		"uuid": uuid.New().String(),
-	}
+    payload := map[string]interface{}{
+        "name": "",
+        "uuid": uuid.New().String(),
+        // 直接指定模型，无需检查用户是否为pro
+        "model": c.opts.Model,
+    }
 
-	pro, err := c.IsPro()
-	if err != nil {
-		return "", err
-	}
+    // 移除以下代码块
+    /*
+    pro, err := c.IsPro()
+    if err != nil {
+        return "", err
+    }
 
-	if pro {
-		// 尊贵的pro - 所有模型都需要指定
-		payload["model"] = c.opts.Model
-	} else {
-		// 免费用户只能使用特定模型
-		if strings.Contains(c.opts.Model, "opus") || strings.Contains(c.opts.Model, "claude-sonnet-4") || strings.Contains(c.opts.Model, "claude-opus-4") {
-			return "", errors.New("failed to used pro model: " + c.opts.Model)
-		}
-		// 对于免费可用的模型，也需要指定
-		payload["model"] = c.opts.Model
-	}
+    if pro {
+        payload["model"] = c.opts.Model
+    } else {
+        if strings.Contains(c.opts.Model, "opus") || strings.Contains(c.opts.Model, "claude-sonnet-4") || strings.Contains(c.opts.Model, "claude-opus-4") {
+            return "", errors.New("failed to used pro model: " + c.opts.Model)
+        }
+        payload["model"] = c.opts.Model
+    }
+    */
 
-	response, err := emit.ClientBuilder(c.session).
-		POST(baseURL+"/organizations/"+o+"/chat_conversations").
-		Ja3().
-		CookieJar(c.opts.jar).
-		JHeader().
-		Header("Origin", "https://claude.ai").
-		Header("Referer", "https://claude.ai/").
-		Header("Accept-Language", "en-US,en;q=0.9").
-		Header("user-agent", userAgent).
-		Body(payload).
-		DoC(emit.Status(http.StatusCreated), emit.IsJSON)
+    response, err := emit.ClientBuilder(c.session).
+        POST(baseURL+"/organizations/"+o+"/chat_conversations").
+        Ja3().
+        CookieJar(c.opts.jar).
+        JHeader().
+        Header("Origin", "https://claude.ai").
+        Header("Referer", "https://claude.ai/").
+        Header("Accept-Language", "en-US,en;q=0.9").
+        Header("user-agent", userAgent).
+        Body(payload).
+        DoC(emit.Status(http.StatusCreated), emit.IsJSON)
 
-	if err != nil {
-		return "", err
-	}
+    if err != nil {
+        return "", err
+    }
 
-	defer response.Body.Close()
-	result, err := emit.ToMap(response)  // 修正：直接传response，不是response.Body
-	if err != nil {
-		return "", err
-	}
+    defer response.Body.Close()
+    result, err := emit.ToMap(response)
+    if err != nil {
+        return "", err
+    }
 
-	if uid, ok := result["uuid"]; ok {
-		if u, okey := uid.(string); okey {
-			c.cid = u
-			return u, nil
-		}
-	}
+    if uid, ok := result["uuid"]; ok {
+        if u, okey := uid.(string); okey {
+            c.cid = u
+            return u, nil
+        }
+    }
 
-	return "", errors.New("failed to fetch the conversation")
+    return "", errors.New("failed to fetch the conversation")
 }
