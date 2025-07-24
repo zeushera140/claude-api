@@ -29,6 +29,135 @@ const (
 	userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 Edg/114.0.1823.79"
 )
 
+// 文件处理类型
+const (
+    FileProcessTypeFiles       = "files"       // 使用files字段（图片、PDF等）
+    FileProcessTypeAttachments = "attachments" // 使用attachments字段（文本、代码等）
+    FileProcessTypeSpecial     = "special"     // 特殊处理（Excel等）
+)
+
+// 定义文件分类映射
+var (
+    // 使用 files 字段的文件类型（二进制文件）
+    filesTypeExtensions = map[string]bool{
+        ".jpg":  true,
+        ".jpeg": true,
+        ".png":  true,
+        ".gif":  true,
+        ".webp": true,
+        ".pdf":  true,
+    }
+    
+    // 使用 attachments 字段的文件类型（文本类文件）
+    attachmentsTypeExtensions = map[string]bool{
+        // 文档类
+        ".txt":  true,
+        ".md":   true,
+        ".rtf":  true,
+        ".tex":  true,
+        ".latex": true,
+        
+        // 代码文件
+        ".py":    true,
+        ".ipynb": true,
+        ".js":    true,
+        ".jsx":   true,
+        ".ts":    true,
+        ".tsx":   true,
+        ".mts":   true,
+        ".cts":   true,
+        ".html":  true,
+        ".css":   true,
+        ".java":  true,
+        ".cs":    true,
+        ".php":   true,
+        ".c":     true,
+        ".cc":    true,
+        ".cpp":   true,
+        ".cxx":   true,
+        ".h":     true,
+        ".hh":    true,
+        ".hpp":   true,
+        ".rs":    true,
+        ".r":     true,
+        ".rmd":   true,
+        ".swift": true,
+        ".go":    true,
+        ".rb":    true,
+        ".kt":    true,
+        ".kts":   true,
+        ".m":     true,
+        ".mm":    true,
+        ".scala": true,
+        ".dart":  true,
+        ".lua":   true,
+        ".pl":    true,
+        ".pm":    true,
+        ".t":     true,
+        ".sh":    true,
+        ".bash":  true,
+        ".zsh":   true,
+        ".bat":   true,
+        ".coffee": true,
+        ".gd":    true,
+        ".gdshader": true,
+        
+        // 配置文件
+        ".ini":    true,
+        ".cfg":    true,
+        ".config": true,
+        ".json":   true,
+        ".yaml":   true,
+        ".yml":    true,
+        ".toml":   true,
+        ".proto":  true,
+        
+        // 数据文件
+        ".csv":    true,
+        ".log":    true,
+        ".sql":    true,
+        
+        // 其他文本格式
+        ".tres":   true,
+        ".tscn":   true,
+    }
+    
+    // 需要特殊处理的文件类型
+    specialTypeExtensions = map[string]bool{
+        ".docx":  true,
+        ".epub":  true,
+        ".odt":   true,
+        ".odp":   true,
+        ".xls":   true,
+        ".xlsx":  true,
+        ".xlsb":  true,
+        ".xlm":   true,
+        ".xlsm":  true,
+        ".xlt":   true,
+        ".xltm":  true,
+        ".xltx":  true,
+        ".ods":   true,
+    }
+)
+
+// GetFileProcessType 获取文件的处理类型
+func GetFileProcessType(fileName string) string {
+    ext := strings.ToLower(filepath.Ext(fileName))
+    
+    if filesTypeExtensions[ext] {
+        return FileProcessTypeFiles
+    }
+    if attachmentsTypeExtensions[ext] {
+        return FileProcessTypeAttachments
+    }
+    if specialTypeExtensions[ext] {
+        return FileProcessTypeSpecial
+    }
+    
+    // 默认作为附件处理
+    return FileProcessTypeAttachments
+}
+
 // 新的消息响应结构
 type MessageResponse struct {
 	Type    string       `json:"type"`
