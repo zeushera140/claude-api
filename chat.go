@@ -272,15 +272,15 @@ func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []strin
 		conversationId = cid
 	}
 
-	// 构建payload
+	// 构建payload - 完全匹配实际请求格式
 	payload := map[string]interface{}{
 		"prompt":               message,
 		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
 		"timezone":             "Asia/Shanghai",
 		"locale":               "en-US",
 		"rendering_mode":       "messages",
-		"attachments":          []interface{}{},
-		"files":                []interface{}{}, // 修改这里
+		"attachments":          []interface{}{}, // 保持空数组
+		"files":                fileUUIDs,      // 直接使用UUID字符串数组
 		"sync_sources":         []interface{}{},
 		"personalized_styles": []map[string]interface{}{
 			{
@@ -301,39 +301,19 @@ func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []strin
 		},
 	}
 
-	// 只有特定模型才需要在completion请求中指定model
-	if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
+	// 添加model字段 - 这是关键！
+	if c.opts.Model != "" {
 		payload["model"] = c.opts.Model
 	}
 
-	// 处理文件UUID - 关键修改在这里！
-	if len(fileUUIDs) > 0 {
-		// 直接将UUID字符串数组赋值给files字段
-		payload["files"] = fileUUIDs
-	}
-
-	// 处理附件
-	if len(attrs) > 0 {
-		attachments := make([]interface{}, 0, len(attrs))
-		for _, attr := range attrs {
-			attachments = append(attachments, map[string]interface{}{
-				"extracted_content": attr.Content,
-				"file_name":        attr.FileName,
-				"file_size":        attr.FileSize,
-				"file_type":        attr.FileType,
-			})
-		}
-		payload["attachments"] = attachments
-	}
-
-	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
+	logrus.Infof("发送请求 - 模型: %s, files: %v", c.opts.Model, fileUUIDs)
 
 	response, err := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
 		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
 		Header("referer", "https://claude.ai/chat/"+conversationId).
-		Header("accept", "text/event-stream").
+		Header("accept", "text/event-stream, text/event-stream").
 		Header("anthropic-client-platform", "web_claude_ai").
 		Header("user-agent", userAgent).
 		JHeader().
