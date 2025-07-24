@@ -310,10 +310,26 @@ func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) 
 	writer := multipart.NewWriter(body)
 	
 	// 创建文件字段
-	part, err := writer.CreateFormFile("file", fileName)
+	import (
+    	"mime/multipart"
+    	"net/textproto"  // 需要添加这个import
+    	// ... 其他imports
+	)
+
+	// 手动创建带正确Content-Type的部分
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, fileName))
+	h.Set("Content-Type", contentType) // 使用传入的contentType
+
+	part, err := writer.CreatePart(h)
 	if err != nil {
-		return nil, err
+    		return nil, err
 	}
+
+// 写入文件数据（这部分保持不变）
+if _, err := part.Write(fileData); err != nil {
+    return nil, err
+}
 	
 	// 写入文件数据
 	if _, err := part.Write(fileData); err != nil {
@@ -327,6 +343,7 @@ func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) 
 	
 	logrus.Infof("Uploading file: %s (type: %s, kind: %s, size: %d bytes)", 
 		fileName, contentType, fileInfo.FileKind, len(fileData))
+	
 	
 	// 发送请求
 	response, err := emit.ClientBuilder(c.session).
