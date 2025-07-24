@@ -157,89 +157,6 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	return ch, nil
 }
 
-func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
-	var (
-		organizationId string
-		conversationId string
-	)
-
-	// 获取组织ID
-	{
-		oid, err := c.getO()
-		if err != nil {
-			return nil, fmt.Errorf("fetch organization failed: %v", err)
-		}
-		organizationId = oid
-	}
-
-	// 获取会话ID
-	{
-		cid, err := c.getC(organizationId)
-		if err != nil {
-			return nil, fmt.Errorf("fetch conversation failed: %v", err)
-		}
-		conversationId = cid
-	}
-
-	// 构建payload - 兼容新旧格式
-	payload := map[string]interface{}{
-		"prompt":               message,
-		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
-		"timezone":             "Asia/Shanghai",
-		"locale":               "en-US",
-		"rendering_mode":       "messages",
-		"attachments":          []interface{}{},
-		"files":                []interface{}{},
-		"sync_sources":         []interface{}{},
-		"personalized_styles": []map[string]interface{}{
-			{
-				"type":        "default",
-				"key":         "Default",
-				"name":        "Normal",
-				"nameKey":     "normal_style_name",
-				"prompt":      "Normal",
-				"summary":     "Default responses from Claude",
-				"summaryKey":  "normal_style_summary",
-				"isDefault":   true,
-			},
-		},
-		"tools": []map[string]interface{}{
-			{"type": "web_search_v0", "name": "web_search"},
-			{"type": "artifacts_v0", "name": "artifacts"},
-			{"type": "repl_v0", "name": "repl"},
-		},
-	}
-
-	// 只有特定模型才需要在completion请求中指定model
-	if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
-		payload["model"] = c.opts.Model
-	}
-
-	// 处理附件
-	if len(attrs) > 0 {
-		payload["attachments"] = attrs
-	}
-
-	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
-
-	response, err := emit.ClientBuilder(c.session).
-		Ja3().
-		CookieJar(c.opts.jar).
-		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
-		Header("referer", "https://claude.ai/chat/"+conversationId).
-		Header("accept", "text/event-stream").
-		Header("anthropic-client-platform", "web_claude_ai").
-		Header("user-agent", userAgent).
-		JHeader().
-		Body(payload).
-		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
-
-	if err != nil {
-		logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
-	}
-
-	return response, err
-}
 
 func (c *Chat) Delete() {
 	if c.oid == "" {
@@ -742,7 +659,7 @@ func (c *Chat) getC(o string) (string, error) {
 // 在 chat.go 文件中添加以下函数
 
 // UploadFile 上传文件到Claude
-func (c *Chat) UploadFile(filename string, fileData []byte, fileType string) (string, error) {
+func (c *Chat) UploadFile(filename string, fileData []byte, contentType string) (string, error) {
     // 获取组织ID
     organizationId, err := c.getO()
     if err != nil {
@@ -759,6 +676,21 @@ func (c *Chat) UploadFile(filename string, fileData []byte, fileType string) (st
         return "", err
     }
     
+    // 如果没有指定content-type，根据文件名猜测
+    if contentType == "" {
+        if strings.HasSuffix(strings.ToLower(filename), ".jpg") || strings.HasSuffix(strings.ToLower(filename), ".jpeg") {
+            contentType = "image/jpeg"
+        } else if strings.HasSuffix(strings.ToLower(filename), ".png") {
+            contentType = "image/png"
+        } else if strings.HasSuffix(strings.ToLower(filename), ".gif") {
+            contentType = "image/gif"
+        } else if strings.HasSuffix(strings.ToLower(filename), ".webp") {
+            contentType = "image/webp"
+        } else {
+            contentType = "application/octet-stream"
+        }
+    }
+    
     _, err = part.Write(fileData)
     if err != nil {
         return "", err
@@ -770,14 +702,19 @@ func (c *Chat) UploadFile(filename string, fileData []byte, fileType string) (st
     }
 
     // 发送上传请求
+    uploadURL := fmt.Sprintf("%s/%s/upload", baseURL, organizationId)
+    logrus.Infof("Uploading file to: %s", uploadURL)
+    
     response, err := emit.ClientBuilder(c.session).
-        POST(baseURL+"/"+organizationId+"/upload").
+        POST(uploadURL).
         Header("content-type", writer.FormDataContentType()).
         Header("origin", "https://claude.ai").
         Header("referer", "https://claude.ai/new").
         Header("user-agent", userAgent).
+        Header("accept", "*/*").
+        Header("accept-language", "en,zh-CN;q=0.9,zh;q=0.8,en-GB;q=0.7,en-US;q=0.6").
         CookieJar(c.opts.jar).
-        Body(buf.Bytes()).
+        Bytes(buf.Bytes()).
         DoC(emit.Status(http.StatusOK), emit.IsJSON)
     
     if err != nil {
@@ -787,15 +724,19 @@ func (c *Chat) UploadFile(filename string, fileData []byte, fileType string) (st
 
     // 解析响应
     var uploadResp FileUploadResponse
-    if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
+    responseBody, _ := io.ReadAll(response.Body)
+    logrus.Debugf("Upload response: %s", string(responseBody))
+    
+    if err := json.Unmarshal(responseBody, &uploadResp); err != nil {
         return "", fmt.Errorf("failed to parse upload response: %v", err)
     }
 
-    // 调用文件处理确认接口 (如果需要)
-    if err := c.confirmFileUpload(uploadResp.FileUUID); err != nil {
-        logrus.Warnf("Failed to confirm file upload: %v", err)
-        // 不一定要失败，可能是可选的
-    }
+    logrus.Infof("File uploaded successfully: %s (UUID: %s)", uploadResp.FileName, uploadResp.FileUUID)
+
+    // 调用文件处理确认接口 (可选，先跳过测试)
+    // if err := c.confirmFileUpload(uploadResp.FileUUID); err != nil {
+    //     logrus.Warnf("Failed to confirm file upload: %v", err)
+    // }
 
     return uploadResp.FileUUID, nil
 }
@@ -823,11 +764,11 @@ func (c *Chat) confirmFileUpload(fileUUID string) error {
     return nil
 }
 
-// 修改 Reply 函数以支持文件附件
-func (c *Chat) ReplyWithFiles(ctx context.Context, message string, attrs []Attachment, files []FileAttachment) (chan PartialResponse, error) {
+func (c *Chat) ReplyWithFiles(ctx context.Context, message string, files []FileAttachment) (chan PartialResponse, error) {
     // 首先上传所有文件
     var fileUUIDs []string
     for _, file := range files {
+        logrus.Infof("Uploading file: %s (%d bytes)", file.FileName, len(file.FileData))
         uuid, err := c.UploadFile(file.FileName, file.FileData, file.FileType)
         if err != nil {
             return nil, fmt.Errorf("failed to upload file %s: %v", file.FileName, err)
@@ -835,7 +776,12 @@ func (c *Chat) ReplyWithFiles(ctx context.Context, message string, attrs []Attac
         fileUUIDs = append(fileUUIDs, uuid)
     }
 
-    // 修改现有的Reply逻辑以包含文件
+    // 使用上传的文件UUID发送消息
+    return c.replyWithFileUUIDs(ctx, message, fileUUIDs)
+}
+
+// replyWithFileUUIDs 使用文件UUID发送消息
+func (c *Chat) replyWithFileUUIDs(ctx context.Context, message string, fileUUIDs []string) (chan PartialResponse, error) {
     if c.opts.Model == "" {
         model, err := c.loadModel()
         if err != nil {
@@ -849,13 +795,22 @@ func (c *Chat) ReplyWithFiles(ctx context.Context, message string, attrs []Attac
     
     var response *http.Response
     for index := 1; index <= c.opts.Retry; index++ {
-        r, err := c.PostMessageWithFiles(message, attrs, fileUUIDs)
+        r, err := c.PostMessageWithFiles(message, nil, fileUUIDs)
         if err != nil {
             if index >= c.opts.Retry {
                 c.mu.Unlock()
                 return nil, err
             }
-            logrus.Error("[retry] ", err)
+            
+            var wap *ErrorWrapper
+            ok := errors.As(err, &wap)
+            
+            if ok && wap.ErrorType.Message == "Invalid model" {
+                c.mu.Unlock()
+                return nil, errors.New(wap.ErrorType.Message)
+            } else {
+                logrus.Error("[retry] ", err)
+            }
         } else {
             response = r
             break
@@ -867,7 +822,6 @@ func (c *Chat) ReplyWithFiles(ctx context.Context, message string, attrs []Attac
     return ch, nil
 }
 
-// PostMessageWithFiles 发送带文件的消息
 func (c *Chat) PostMessageWithFiles(message string, attrs []Attachment, fileUUIDs []string) (*http.Response, error) {
     var (
         organizationId string
@@ -931,7 +885,7 @@ func (c *Chat) PostMessageWithFiles(message string, attrs []Attachment, fileUUID
         payload["attachments"] = attrs
     }
 
-    logrus.Infof("发送请求 - 模型: %s, 文件数: %d", c.opts.Model, len(fileUUIDs))
+    logrus.Infof("发送请求 - 模型: %s, 文件数: %d, fileUUIDs: %v", c.opts.Model, len(fileUUIDs), fileUUIDs)
 
     response, err := emit.ClientBuilder(c.session).
         Ja3().
@@ -945,5 +899,14 @@ func (c *Chat) PostMessageWithFiles(message string, attrs []Attachment, fileUUID
         Body(payload).
         DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
 
+    if err != nil {
+        logrus.Errorf("请求失败 - 模型: %s, 错误: %v", c.opts.Model, err)
+    }
+
     return response, err
+}
+
+// 保留原有的 PostMessage 函数以保持向后兼容
+func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
+    return c.PostMessageWithFiles(message, attrs, []string{})
 }
