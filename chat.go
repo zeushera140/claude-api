@@ -106,19 +106,22 @@ func (c *Chat) UploadFile(filename string, fileContent []byte) (*UploadResponse,
 		return nil, err
 	}
 	
-	// 关闭writer以设置boundary
+	// 关闭writer
 	err = writer.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	// 发送上传请求
+	// 发送上传请求 - 注意URL格式
+	uploadURL := fmt.Sprintf("%s/%s/upload", baseURL, organizationId)
+	logrus.Infof("Uploading file to: %s", uploadURL)
+	
 	response, err := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
-		POST(baseURL+"/"+organizationId+"/upload").
+		POST(uploadURL).
 		Header("content-type", writer.FormDataContentType()).
-		Header("referer", "https://claude.ai/new").
+		Header("referer", "https://claude.ai/chat").
 		Header("origin", "https://claude.ai").
 		Header("user-agent", userAgent).
 		Bytes(body.Bytes()).
@@ -130,22 +133,28 @@ func (c *Chat) UploadFile(filename string, fileContent []byte) (*UploadResponse,
 	
 	defer response.Body.Close()
 	
-	// 解析响应
-	var uploadResp UploadResponse
-	if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
-		return nil, fmt.Errorf("parse upload response failed: %v", err)
+	// 读取并记录响应
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response failed: %v", err)
 	}
 	
-	// 发送上传完成信号到 a-api.anthropic.com
+	logrus.Infof("Upload response: %s", string(responseBody))
+	
+	// 解析响应
+	var uploadResp UploadResponse
+	if err := json.Unmarshal(responseBody, &uploadResp); err != nil {
+		return nil, fmt.Errorf("parse upload response failed: %v, body: %s", err, string(responseBody))
+	}
+	
+	// 发送上传完成信号
 	err = c.sendUploadSignal()
 	if err != nil {
 		logrus.Warnf("send upload signal failed: %v", err)
-		// 不要因为这个失败而中断流程
 	}
 	
 	return &uploadResp, nil
 }
-
 // sendUploadSignal 发送上传完成信号
 func (c *Chat) sendUploadSignal() error {
 	payload := map[string]bool{
