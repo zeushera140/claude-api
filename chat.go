@@ -283,137 +283,139 @@ func (c *Chat) Client(session *emit.Session) {
 	c.session = session
 }
 
-// 原始的Reply方法，保持向后兼容
+// 修改 ReplyWithFiles 方法，新的签名
+func (c *Chat) ReplyWithFiles(ctx context.Context, message string, fileUUIDs []string, attachments []Attachment) (chan PartialResponse, error) {
+    if c.opts.Model == "" {
+        // 动态加载 model
+        model, err := c.loadModel()
+        if err != nil {
+            return nil, err
+        }
+        c.opts.Model = model
+    }
+
+    c.mu.Lock()
+    logrus.Info("curr model: ", c.opts.Model)
+    var response *http.Response
+    for index := 1; index <= c.opts.Retry; index++ {
+        r, err := c.PostMessageWithFiles(message, fileUUIDs, attachments)
+        if err != nil {
+            if index >= c.opts.Retry {
+                c.mu.Unlock()
+                return nil, err
+            }
+
+            var wap *ErrorWrapper
+            ok := errors.As(err, &wap)
+
+            if ok && wap.ErrorType.Message == "Invalid model" {
+                c.mu.Unlock()
+                return nil, errors.New(wap.ErrorType.Message)
+            } else {
+                logrus.Error("[retry] ", err)
+            }
+        } else {
+            response = r
+            break
+        }
+    }
+
+    ch := make(chan PartialResponse)
+    go c.resolve(ctx, response, ch)
+    return ch, nil
+}
+
+// 保持向后兼容
 func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (chan PartialResponse, error) {
-	return c.ReplyWithFiles(ctx, message, []string{})
+    return c.ReplyWithFiles(ctx, message, []string{}, attrs)
 }
 
-// 新的ReplyWithFiles方法，支持文件UUID
-func (c *Chat) ReplyWithFiles(ctx context.Context, message string, fileUUIDs []string) (chan PartialResponse, error) {
-	if c.opts.Model == "" {
-		// 动态加载 model
-		model, err := c.loadModel()
-		if err != nil {
-			return nil, err
-		}
-		c.opts.Model = model
-	}
-
-	c.mu.Lock()
-	logrus.Info("curr model: ", c.opts.Model)
-	var response *http.Response
-	for index := 1; index <= c.opts.Retry; index++ {
-		r, err := c.PostMessageWithFiles(message, fileUUIDs)
-		if err != nil {
-			if index >= c.opts.Retry {
-				c.mu.Unlock()
-				return nil, err
-			}
-
-			var wap *ErrorWrapper
-			ok := errors.As(err, &wap)
-
-			if ok && wap.ErrorType.Message == "Invalid model" {
-				c.mu.Unlock()
-				return nil, errors.New(wap.ErrorType.Message)
-			} else {
-				logrus.Error("[retry] ", err)
-			}
-		} else {
-			response = r
-			break
-		}
-	}
-
-	ch := make(chan PartialResponse)
-	go c.resolve(ctx, response, ch)
-	return ch, nil
-}
 
 // 原始的PostMessage方法，保持向后兼容
 func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
 	return c.PostMessageWithFiles(message, []string{})
 }
 
-// 新的PostMessageWithFiles方法
-func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string) (*http.Response, error) {
-	var (
-		organizationId string
-		conversationId string
-	)
+func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string, attachments []Attachment) (*http.Response, error) {
+    var (
+        organizationId string
+        conversationId string
+    )
 
-	// 获取组织ID
-	{
-		oid, err := c.getO()
-		if err != nil {
-			return nil, fmt.Errorf("fetch organization failed: %v", err)
-		}
-		organizationId = oid
-	}
+    // 获取组织ID
+    {
+        oid, err := c.getO()
+        if err != nil {
+            return nil, fmt.Errorf("fetch organization failed: %v", err)
+        }
+        organizationId = oid
+    }
 
-	// 获取会话ID
-	{
-		cid, err := c.getC(organizationId)
-		if err != nil {
-			return nil, fmt.Errorf("fetch conversation failed: %v", err)
-		}
-		conversationId = cid
-	}
+    // 获取会话ID
+    {
+        cid, err := c.getC(organizationId)
+        if err != nil {
+            return nil, fmt.Errorf("fetch conversation failed: %v", err)
+        }
+        conversationId = cid
+    }
 
-	// 构建payload
-	payload := map[string]interface{}{
-		"prompt":               message,
-		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
-		"timezone":             "Asia/Shanghai",
-		"locale":               "en-US",
-		"rendering_mode":       "messages",
-		"attachments":          []interface{}{},
-		"files":                fileUUIDs,
-		"sync_sources":         []interface{}{},
-		"personalized_styles": []map[string]interface{}{
-			{
-				"type":        "default",
-				"key":         "Default",
-				"name":        "Normal",
-				"nameKey":     "normal_style_name",
-				"prompt":      "Normal",
-				"summary":     "Default responses from Claude",
-				"summaryKey":  "normal_style_summary",
-				"isDefault":   true,
-			},
-		},
-		"tools": []map[string]interface{}{
-			{"type": "web_search_v0", "name": "web_search"},
-			{"type": "artifacts_v0", "name": "artifacts"},
-			{"type": "repl_v0", "name": "repl"},
-		},
-	}
+    // 构建payload
+    payload := map[string]interface{}{
+        "prompt":               message,
+        "parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
+        "timezone":             "Asia/Shanghai",
+        "locale":               "en-US",
+        "rendering_mode":       "messages",
+        "attachments":          attachments,  // 文本类文件
+        "files":                fileUUIDs,    // 二进制文件UUID
+        "sync_sources":         []interface{}{},
+        "personalized_styles": []map[string]interface{}{
+            {
+                "type":        "default",
+                "key":         "Default",
+                "name":        "Normal",
+                "nameKey":     "normal_style_name",
+                "prompt":      "Normal",
+                "summary":     "Default responses from Claude",
+                "summaryKey":  "normal_style_summary",
+                "isDefault":   true,
+            },
+        },
+        "tools": []map[string]interface{}{
+            {"type": "web_search_v0", "name": "web_search"},
+            {"type": "artifacts_v0", "name": "artifacts"},
+            {"type": "repl_v0", "name": "repl"},
+        },
+    }
 
-	// 只有特定模型才需要在completion请求中指定model
-	if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
-		payload["model"] = c.opts.Model
-	}
+    // 只有特定模型才需要在completion请求中指定model
+    if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
+        payload["model"] = c.opts.Model
+    }
 
-	logrus.Infof("发送请求 - 模型: %s, 文件数: %d", c.opts.Model, len(fileUUIDs))
+    logrus.Infof("发送请求 - 模型: %s, files数: %d, attachments数: %d", 
+        c.opts.Model, len(fileUUIDs), len(attachments))
 
-	response, err := emit.ClientBuilder(c.session).
-		Ja3().
-		CookieJar(c.opts.jar).
-		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
-		Header("referer", "https://claude.ai/chat/"+conversationId).
-		Header("accept", "text/event-stream").
-		Header("anthropic-client-platform", "web_claude_ai").
-		Header("user-agent", userAgent).
-		JHeader().
-		Body(payload).
-		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+    response, err := emit.ClientBuilder(c.session).
+        Ja3().
+        CookieJar(c.opts.jar).
+        POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+        Header("referer", "https://claude.ai/chat/"+conversationId).
+        Header("accept", "text/event-stream").
+        Header("anthropic-client-platform", "web_claude_ai").
+        Header("user-agent", userAgent).
+        JHeader().
+        Body(payload).
+        DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
 
-	if err != nil {
-		logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
-	}
+    if err != nil {
+        logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
+    }
 
-	return response, err
+    return response, err
 }
+
 
 // 文件上传方法
 func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) (*FileUploadResponse, error) {
