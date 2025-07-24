@@ -1,7 +1,7 @@
 package claude
 
 import (
-	"fmt"
+	"fmt"   // 添加这个
 	"bufio"
 	"bytes"
 	"context"
@@ -13,9 +13,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"io"
-	"mime/multipart"
-	//"path/filepath"
 )
 
 var (
@@ -82,104 +79,6 @@ func Ja3(j string) {
 	ja3 = j
 }
 
-// UploadFile 上传文件到Claude
-func (c *Chat) UploadFile(filename string, fileContent []byte) (*UploadResponse, error) {
-	// 获取组织ID
-	organizationId, err := c.getO()
-	if err != nil {
-		return nil, fmt.Errorf("fetch organization failed: %v", err)
-	}
-
-	// 创建multipart请求体
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	
-	// 创建文件字段
-	part, err := writer.CreateFormFile("file", filename)
-	if err != nil {
-		return nil, err
-	}
-	
-	// 写入文件内容
-	_, err = io.Copy(part, bytes.NewReader(fileContent))
-	if err != nil {
-		return nil, err
-	}
-	
-	// 关闭writer
-	err = writer.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	// 发送上传请求 - 注意URL格式
-	uploadURL := fmt.Sprintf("%s/%s/upload", baseURL, organizationId)
-	logrus.Infof("Uploading file to: %s", uploadURL)
-	
-	response, err := emit.ClientBuilder(c.session).
-		Ja3().
-		CookieJar(c.opts.jar).
-		POST(uploadURL).
-		Header("content-type", writer.FormDataContentType()).
-		Header("referer", "https://claude.ai/chat").
-		Header("origin", "https://claude.ai").
-		Header("user-agent", userAgent).
-		Bytes(body.Bytes()).
-		DoC(emit.Status(http.StatusOK), emit.IsJSON)
-	
-	if err != nil {
-		return nil, fmt.Errorf("upload failed: %v", err)
-	}
-	
-	defer response.Body.Close()
-	
-	// 读取并记录响应
-	responseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response failed: %v", err)
-	}
-	
-	logrus.Infof("Upload response: %s", string(responseBody))
-	
-	// 解析响应
-	var uploadResp UploadResponse
-	if err := json.Unmarshal(responseBody, &uploadResp); err != nil {
-		return nil, fmt.Errorf("parse upload response failed: %v, body: %s", err, string(responseBody))
-	}
-	
-	// 发送上传完成信号
-	err = c.sendUploadSignal()
-	if err != nil {
-		logrus.Warnf("send upload signal failed: %v", err)
-	}
-	
-	return &uploadResp, nil
-}
-// sendUploadSignal 发送上传完成信号
-func (c *Chat) sendUploadSignal() error {
-	payload := map[string]bool{
-		"success": true,
-	}
-	
-	response, err := emit.ClientBuilder(c.session).
-		Ja3().
-		CookieJar(c.opts.jar).
-		POST("https://a-api.anthropic.com/v1/t").
-		Header("referer", "https://claude.ai/").
-		Header("origin", "https://claude.ai").
-		Header("user-agent", userAgent).
-		JHeader().
-		Body(payload).
-		DoC(emit.Status(http.StatusOK))
-	
-	if err != nil {
-		return err
-	}
-	
-	response.Body.Close()
-	return nil
-}
-
 func NewDefaultOptions(cookies string, model string, mode string) (*Options, error) {
     options := Options{
         Retry: 2,
@@ -215,8 +114,7 @@ func (c *Chat) Client(session *emit.Session) {
 	c.session = session
 }
 
-// 修改 Reply 函数签名，返回上传的文件信息
-func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment, fileUUIDs []string) (chan PartialResponse, error) {
+func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (chan PartialResponse, error) {
 	if c.opts.Model == "" {
 		// 动态加载 model
 		model, err := c.loadModel()
@@ -230,7 +128,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment, fi
 	logrus.Info("curr model: ", c.opts.Model)
 	var response *http.Response
 	for index := 1; index <= c.opts.Retry; index++ {
-		r, err := c.PostMessage(message, attrs, fileUUIDs)
+		r, err := c.PostMessage(message, attrs)
 		if err != nil {
 			if index >= c.opts.Retry {
 				c.mu.Unlock()
@@ -257,7 +155,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment, fi
 	return ch, nil
 }
 
-func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []string) (*http.Response, error) {
+func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
 	var (
 		organizationId string
 		conversationId string
@@ -281,15 +179,15 @@ func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []strin
 		conversationId = cid
 	}
 
-	// 构建payload - 完全匹配实际请求格式
+	// 构建payload - 兼容新旧格式
 	payload := map[string]interface{}{
 		"prompt":               message,
 		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
 		"timezone":             "Asia/Shanghai",
 		"locale":               "en-US",
 		"rendering_mode":       "messages",
-		"attachments":          []interface{}{}, // 保持空数组
-		"files":                fileUUIDs,      // 直接使用UUID字符串数组
+		"attachments":          []interface{}{},
+		"files":                []interface{}{},
 		"sync_sources":         []interface{}{},
 		"personalized_styles": []map[string]interface{}{
 			{
@@ -310,19 +208,24 @@ func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []strin
 		},
 	}
 
-	// 添加model字段 - 这是关键！
-	if c.opts.Model != "" {
+	// 只有特定模型才需要在completion请求中指定model
+	if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
 		payload["model"] = c.opts.Model
 	}
 
-	logrus.Infof("发送请求 - 模型: %s, files: %v", c.opts.Model, fileUUIDs)
+	// 处理附件
+	if len(attrs) > 0 {
+		payload["attachments"] = attrs
+	}
+
+	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
 
 	response, err := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
 		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
 		Header("referer", "https://claude.ai/chat/"+conversationId).
-		Header("accept", "text/event-stream, text/event-stream").
+		Header("accept", "text/event-stream").
 		Header("anthropic-client-platform", "web_claude_ai").
 		Header("user-agent", userAgent).
 		JHeader().
@@ -832,4 +735,213 @@ func (c *Chat) getC(o string) (string, error) {
     }
 
     return "", errors.New("failed to fetch the conversation")
+}
+
+// 在 chat.go 文件中添加以下函数
+
+// UploadFile 上传文件到Claude
+func (c *Chat) UploadFile(filename string, fileData []byte, fileType string) (string, error) {
+    // 获取组织ID
+    organizationId, err := c.getO()
+    if err != nil {
+        return "", fmt.Errorf("failed to get organization: %v", err)
+    }
+
+    // 创建multipart form
+    var buf bytes.Buffer
+    writer := multipart.NewWriter(&buf)
+    
+    // 添加文件字段
+    part, err := writer.CreateFormFile("file", filename)
+    if err != nil {
+        return "", err
+    }
+    
+    _, err = part.Write(fileData)
+    if err != nil {
+        return "", err
+    }
+    
+    err = writer.Close()
+    if err != nil {
+        return "", err
+    }
+
+    // 发送上传请求
+    response, err := emit.ClientBuilder(c.session).
+        POST(baseURL+"/"+organizationId+"/upload").
+        Header("content-type", writer.FormDataContentType()).
+        Header("origin", "https://claude.ai").
+        Header("referer", "https://claude.ai/new").
+        Header("user-agent", userAgent).
+        CookieJar(c.opts.jar).
+        Body(buf.Bytes()).
+        DoC(emit.Status(http.StatusOK), emit.IsJSON)
+    
+    if err != nil {
+        return "", fmt.Errorf("upload failed: %v", err)
+    }
+    defer response.Body.Close()
+
+    // 解析响应
+    var uploadResp FileUploadResponse
+    if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
+        return "", fmt.Errorf("failed to parse upload response: %v", err)
+    }
+
+    // 调用文件处理确认接口 (如果需要)
+    if err := c.confirmFileUpload(uploadResp.FileUUID); err != nil {
+        logrus.Warnf("Failed to confirm file upload: %v", err)
+        // 不一定要失败，可能是可选的
+    }
+
+    return uploadResp.FileUUID, nil
+}
+
+// confirmFileUpload 确认文件上传（对应 /v1/t 请求）
+func (c *Chat) confirmFileUpload(fileUUID string) error {
+    // 这里需要知道具体的请求体格式
+    // 暂时留空，等您提供更多信息
+    
+    // payload := map[string]interface{}{
+    //     "file_uuid": fileUUID,
+    //     // 其他必要字段
+    // }
+    
+    // response, err := emit.ClientBuilder(c.session).
+    //     POST("https://a-api.anthropic.com/v1/t").
+    //     Header("origin", "https://claude.ai").
+    //     Header("referer", "https://claude.ai/new").
+    //     Header("user-agent", userAgent).
+    //     CookieJar(c.opts.jar).
+    //     JHeader().
+    //     Body(payload).
+    //     DoC(emit.Status(http.StatusOK), emit.IsJSON)
+    
+    return nil
+}
+
+// 修改 Reply 函数以支持文件附件
+func (c *Chat) ReplyWithFiles(ctx context.Context, message string, attrs []Attachment, files []FileAttachment) (chan PartialResponse, error) {
+    // 首先上传所有文件
+    var fileUUIDs []string
+    for _, file := range files {
+        uuid, err := c.UploadFile(file.FileName, file.FileData, file.FileType)
+        if err != nil {
+            return nil, fmt.Errorf("failed to upload file %s: %v", file.FileName, err)
+        }
+        fileUUIDs = append(fileUUIDs, uuid)
+    }
+
+    // 修改现有的Reply逻辑以包含文件
+    if c.opts.Model == "" {
+        model, err := c.loadModel()
+        if err != nil {
+            return nil, err
+        }
+        c.opts.Model = model
+    }
+
+    c.mu.Lock()
+    logrus.Info("curr model: ", c.opts.Model)
+    
+    var response *http.Response
+    for index := 1; index <= c.opts.Retry; index++ {
+        r, err := c.PostMessageWithFiles(message, attrs, fileUUIDs)
+        if err != nil {
+            if index >= c.opts.Retry {
+                c.mu.Unlock()
+                return nil, err
+            }
+            logrus.Error("[retry] ", err)
+        } else {
+            response = r
+            break
+        }
+    }
+
+    ch := make(chan PartialResponse)
+    go c.resolve(ctx, response, ch)
+    return ch, nil
+}
+
+// PostMessageWithFiles 发送带文件的消息
+func (c *Chat) PostMessageWithFiles(message string, attrs []Attachment, fileUUIDs []string) (*http.Response, error) {
+    var (
+        organizationId string
+        conversationId string
+    )
+
+    // 获取组织ID
+    {
+        oid, err := c.getO()
+        if err != nil {
+            return nil, fmt.Errorf("fetch organization failed: %v", err)
+        }
+        organizationId = oid
+    }
+
+    // 获取会话ID
+    {
+        cid, err := c.getC(organizationId)
+        if err != nil {
+            return nil, fmt.Errorf("fetch conversation failed: %v", err)
+        }
+        conversationId = cid
+    }
+
+    // 构建payload
+    payload := map[string]interface{}{
+        "prompt":               message,
+        "parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
+        "timezone":             "Asia/Shanghai",
+        "locale":               "en-US",
+        "rendering_mode":       "messages",
+        "attachments":          []interface{}{},
+        "files":                fileUUIDs, // 添加文件UUID数组
+        "sync_sources":         []interface{}{},
+        "personalized_styles": []map[string]interface{}{
+            {
+                "type":        "default",
+                "key":         "Default",
+                "name":        "Normal",
+                "nameKey":     "normal_style_name",
+                "prompt":      "Normal",
+                "summary":     "Default responses from Claude",
+                "summaryKey":  "normal_style_summary",
+                "isDefault":   true,
+            },
+        },
+        "tools": []map[string]interface{}{
+            {"type": "web_search_v0", "name": "web_search"},
+            {"type": "artifacts_v0", "name": "artifacts"},
+            {"type": "repl_v0", "name": "repl"},
+        },
+    }
+
+    // 设置模型
+    if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
+        payload["model"] = c.opts.Model
+    }
+
+    // 处理附件
+    if len(attrs) > 0 {
+        payload["attachments"] = attrs
+    }
+
+    logrus.Infof("发送请求 - 模型: %s, 文件数: %d", c.opts.Model, len(fileUUIDs))
+
+    response, err := emit.ClientBuilder(c.session).
+        Ja3().
+        CookieJar(c.opts.jar).
+        POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+        Header("referer", "https://claude.ai/chat/"+conversationId).
+        Header("accept", "text/event-stream").
+        Header("anthropic-client-platform", "web_claude_ai").
+        Header("user-agent", userAgent).
+        JHeader().
+        Body(payload).
+        DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+
+    return response, err
 }
