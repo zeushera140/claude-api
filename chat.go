@@ -331,11 +331,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 }
 
 
-// 原始的PostMessage方法，保持向后兼容
-func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
-    return c.PostMessageWithFiles(message, []string{}, attrs)
-}
-
+// 修改 PostMessageWithFiles 方法
 func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string, attachments []Attachment) (*http.Response, error) {
     var (
         organizationId string
@@ -360,6 +356,14 @@ func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string, attachme
         conversationId = cid
     }
 
+    // 确保 files 和 attachments 永远不为 nil
+    if fileUUIDs == nil {
+        fileUUIDs = []string{}
+    }
+    if attachments == nil {
+        attachments = []Attachment{}
+    }
+
     // 构建payload
     payload := map[string]interface{}{
         "prompt":               message,
@@ -367,8 +371,8 @@ func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string, attachme
         "timezone":             "Asia/Shanghai",
         "locale":               "en-US",
         "rendering_mode":       "messages",
-        "attachments":          attachments,  // 文本类文件
-        "files":                fileUUIDs,    // 二进制文件UUID
+        "attachments":          attachments,      // 确保是数组
+        "files":                fileUUIDs,        // 确保是数组
         "sync_sources":         []interface{}{},
         "personalized_styles": []map[string]interface{}{
             {
