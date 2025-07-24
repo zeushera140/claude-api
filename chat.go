@@ -309,12 +309,6 @@ func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	
-	// 创建文件字段
-	import (
-    	"mime/multipart"
-    	"net/textproto"  // 需要添加这个import
-    	// ... 其他imports
-	)
 
 	// 手动创建带正确Content-Type的部分
 	h := make(textproto.MIMEHeader)
@@ -326,10 +320,6 @@ func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) 
     		return nil, err
 	}
 
-// 写入文件数据（这部分保持不变）
-if _, err := part.Write(fileData); err != nil {
-    return nil, err
-}
 	
 	// 写入文件数据
 	if _, err := part.Write(fileData); err != nil {
