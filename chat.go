@@ -1,8 +1,7 @@
 package claude
 
 import (
-	"fmt"   // 添加这个
-	"io"
+	"fmt"
 	"bufio"
 	"bytes"
 	"context"
@@ -14,8 +13,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"io"
 	"mime/multipart"
-
+	"path/filepath"
 )
 
 var (
@@ -78,6 +78,13 @@ type webClaude2Response struct {
 	} `json:"messageLimit"`
 }
 
+// FileUpload represents a file to be uploaded
+type FileUpload struct {
+	Filename string
+	Content  []byte
+	MimeType string
+}
+
 func Ja3(j string) {
 	ja3 = j
 }
@@ -86,7 +93,7 @@ func NewDefaultOptions(cookies string, model string, mode string) (*Options, err
     options := Options{
         Retry: 2,
         Model: model,
-        Mode:  mode, // Add mode parameter
+        Mode:  mode,
     }
 
     if cookies != "" {
@@ -117,7 +124,91 @@ func (c *Chat) Client(session *emit.Session) {
 	c.session = session
 }
 
-func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (chan PartialResponse, error) {
+// UploadFile uploads a file to Claude and returns the file UUID
+func (c *Chat) UploadFile(file *FileUpload) (*FileUploadResponse, error) {
+	// Get organization ID
+	oid, err := c.getO()
+	if err != nil {
+		return nil, fmt.Errorf("fetch organization failed: %v", err)
+	}
+
+	// Create multipart form
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	
+	// Add file part
+	part, err := writer.CreateFormFile("file", file.Filename)
+	if err != nil {
+		return nil, fmt.Errorf("create form file failed: %v", err)
+	}
+	
+	if _, err := io.Copy(part, bytes.NewReader(file.Content)); err != nil {
+		return nil, fmt.Errorf("write file content failed: %v", err)
+	}
+	
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("close multipart writer failed: %v", err)
+	}
+
+	// Send upload request
+	response, err := emit.ClientBuilder(c.session).
+		Ja3().
+		CookieJar(c.opts.jar).
+		POST(baseURL+"/"+oid+"/upload").
+		Header("Origin", "https://claude.ai").
+		Header("Referer", "https://claude.ai/new").
+		Header("Accept", "application/json, text/plain, */*").
+		Header("Accept-Language", "en-US,en;q=0.9").
+		Header("user-agent", userAgent).
+		Header("Content-Type", writer.FormDataContentType()).
+		Bytes(buf.Bytes()).
+		DoC(emit.Status(http.StatusOK), emit.IsJSON)
+		
+	if err != nil {
+		return nil, fmt.Errorf("upload request failed: %v", err)
+	}
+	defer response.Body.Close()
+
+	// Parse response
+	var uploadResp FileUploadResponse
+	if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
+		return nil, fmt.Errorf("parse upload response failed: %v", err)
+	}
+
+	logrus.Infof("File uploaded successfully: UUID=%s, Name=%s", uploadResp.FileUUID, uploadResp.FileName)
+	
+	// Send telemetry (optional, ignoring errors)
+	c.sendTelemetry()
+	
+	return &uploadResp, nil
+}
+
+// sendTelemetry sends usage statistics to Anthropic
+func (c *Chat) sendTelemetry() {
+	payload := map[string]interface{}{
+		"success": true,
+	}
+	
+	response, err := emit.ClientBuilder(c.session).
+		Ja3().
+		POST("https://a-api.anthropic.com/v1/t").
+		Header("Origin", "https://claude.ai").
+		Header("Referer", "https://claude.ai/").
+		Header("Accept", "*/*").
+		Header("user-agent", userAgent).
+		JHeader().
+		Body(payload).
+		DoC(emit.Status(http.StatusOK))
+		
+	if err != nil {
+		logrus.Debugf("Telemetry send failed (ignoring): %v", err)
+	} else {
+		response.Body.Close()
+	}
+}
+
+// ReplyWithFiles sends a message with file attachments
+func (c *Chat) ReplyWithFiles(ctx context.Context, message string, attrs []Attachment, files []string) (chan PartialResponse, error) {
 	if c.opts.Model == "" {
 		// 动态加载 model
 		model, err := c.loadModel()
@@ -131,7 +222,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	logrus.Info("curr model: ", c.opts.Model)
 	var response *http.Response
 	for index := 1; index <= c.opts.Retry; index++ {
-		r, err := c.PostMessage(message, attrs)
+		r, err := c.PostMessageWithFiles(message, attrs, files)
 		if err != nil {
 			if index >= c.opts.Retry {
 				c.mu.Unlock()
@@ -158,6 +249,105 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	return ch, nil
 }
 
+// Reply sends a message without files (backward compatibility)
+func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (chan PartialResponse, error) {
+	return c.ReplyWithFiles(ctx, message, attrs, nil)
+}
+
+// PostMessageWithFiles sends a message with optional file UUIDs
+func (c *Chat) PostMessageWithFiles(message string, attrs []Attachment, fileUUIDs []string) (*http.Response, error) {
+	var (
+		organizationId string
+		conversationId string
+	)
+
+	// 获取组织ID
+	{
+		oid, err := c.getO()
+		if err != nil {
+			return nil, fmt.Errorf("fetch organization failed: %v", err)
+		}
+		organizationId = oid
+	}
+
+	// 获取会话ID
+	{
+		cid, err := c.getC(organizationId)
+		if err != nil {
+			return nil, fmt.Errorf("fetch conversation failed: %v", err)
+		}
+		conversationId = cid
+	}
+
+	// 构建payload - 兼容新旧格式
+	payload := map[string]interface{}{
+		"prompt":               message,
+		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
+		"timezone":             "Asia/Shanghai",
+		"locale":               "en-US",
+		"rendering_mode":       "messages",
+		"attachments":          []interface{}{},
+		"files":                []interface{}{},
+		"sync_sources":         []interface{}{},
+		"personalized_styles": []map[string]interface{}{
+			{
+				"type":        "default",
+				"key":         "Default",
+				"name":        "Normal",
+				"nameKey":     "normal_style_name",
+				"prompt":      "Normal",
+				"summary":     "Default responses from Claude",
+				"summaryKey":  "normal_style_summary",
+				"isDefault":   true,
+			},
+		},
+		"tools": []map[string]interface{}{
+			{"type": "web_search_v0", "name": "web_search"},
+			{"type": "artifacts_v0", "name": "artifacts"},
+			{"type": "repl_v0", "name": "repl"},
+		},
+	}
+
+	// 只有特定模型才需要在completion请求中指定model
+	if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
+		payload["model"] = c.opts.Model
+	}
+
+	// 处理附件 (旧方式，保持兼容)
+	if len(attrs) > 0 {
+		payload["attachments"] = attrs
+	}
+	
+	// 处理文件UUIDs (新方式)
+	if len(fileUUIDs) > 0 {
+		payload["files"] = fileUUIDs
+	}
+
+	logrus.Infof("发送请求 - 模型: %s, files: %v", c.opts.Model, fileUUIDs)
+
+	response, err := emit.ClientBuilder(c.session).
+		Ja3().
+		CookieJar(c.opts.jar).
+		POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
+		Header("referer", "https://claude.ai/chat/"+conversationId).
+		Header("accept", "text/event-stream").
+		Header("anthropic-client-platform", "web_claude_ai").
+		Header("user-agent", userAgent).
+		JHeader().
+		Body(payload).
+		DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
+
+	if err != nil {
+		logrus.Errorf("请求失败 - 模型: %s, 错误类型: %T, 错误内容: %v", c.opts.Model, err, err)
+	}
+
+	return response, err
+}
+
+// PostMessage maintains backward compatibility
+func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
+	return c.PostMessageWithFiles(message, attrs, nil)
+}
 
 func (c *Chat) Delete() {
 	if c.oid == "" {
@@ -183,7 +373,7 @@ func (c *Chat) Delete() {
 	}
 }
 
-	// 添加新的响应结构体
+// 添加新的响应结构体
 type ContentBlockDelta struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
@@ -368,103 +558,103 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 	}
 }
     
-    // 解析响应并发送消息的辅助函数
-    func (c *Chat) parseAndSendResponse(dataContent string, message chan PartialResponse) error {
-    	if strings.TrimSpace(dataContent) == "" || dataContent == "[DONE]" {
-    		return nil
-    	}
+// 解析响应并发送消息的辅助函数
+func (c *Chat) parseAndSendResponse(dataContent string, message chan PartialResponse) error {
+	if strings.TrimSpace(dataContent) == "" || dataContent == "[DONE]" {
+		return nil
+	}
+
+	// 尝试解析为原始webClaude2Response格式
+	var response webClaude2Response
+	if err := json.Unmarshal([]byte(dataContent), &response); err == nil && response.Completion != "" {
+		logrus.Infof("Parsed webClaude2Response: completion='%s', stop_reason='%s'", response.Completion, response.StopReason)
+		message <- PartialResponse{
+			Text:    response.Completion,
+			RawData: []byte(dataContent),
+		}
+		return nil
+	}
+
+	// 尝试解析为新的流式格式（类似OpenAI）
+	var streamResponse struct {
+		Type   string `json:"type"`
+		Index  int    `json:"index"`
+		Delta  struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
+		ContentBlock struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_block"`
+	}
+	
+	if err := json.Unmarshal([]byte(dataContent), &streamResponse); err == nil {
+		text := ""
+		if streamResponse.Delta.Text != "" {
+			text = streamResponse.Delta.Text
+		} else if streamResponse.ContentBlock.Text != "" {
+			text = streamResponse.ContentBlock.Text
+		}
+		
+		if text != "" {
+			logrus.Infof("Parsed stream response: text='%s'", text)
+			message <- PartialResponse{
+				Text:    text,
+				RawData: []byte(dataContent),
+			}
+			return nil
+		}
+	}
+
+	// 尝试解析其他可能的格式
+	var genericResponse map[string]interface{}
+	if err := json.Unmarshal([]byte(dataContent), &genericResponse); err == nil {
+		logrus.Infof("Generic response keys: %v", getKeys(genericResponse))
+		
+		// 寻找可能包含文本内容的字段
+		possibleTextFields := []string{"completion", "text", "content", "message"}
+		for _, field := range possibleTextFields {
+			if value, exists := genericResponse[field]; exists {
+				if textValue, ok := value.(string); ok && textValue != "" {
+					logrus.Infof("Found text in field '%s': %s", field, textValue)
+					message <- PartialResponse{
+						Text:    textValue,
+						RawData: []byte(dataContent),
+					}
+					return nil
+				}
+			}
+		}
+		
+		// 检查嵌套的delta或content字段
+		if delta, exists := genericResponse["delta"]; exists {
+			if deltaMap, ok := delta.(map[string]interface{}); ok {
+				if text, exists := deltaMap["text"]; exists {
+					if textValue, ok := text.(string); ok && textValue != "" {
+						logrus.Infof("Found text in delta.text: %s", textValue)
+						message <- PartialResponse{
+							Text:    textValue,
+							RawData: []byte(dataContent),
+						}
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	return fmt.Errorf("unable to parse response: %s", dataContent)
+}
     
-    	// 尝试解析为原始webClaude2Response格式
-    	var response webClaude2Response
-    	if err := json.Unmarshal([]byte(dataContent), &response); err == nil && response.Completion != "" {
-    		logrus.Infof("Parsed webClaude2Response: completion='%s', stop_reason='%s'", response.Completion, response.StopReason)
-    		message <- PartialResponse{
-    			Text:    response.Completion,
-    			RawData: []byte(dataContent),
-    		}
-    		return nil
-    	}
-    
-    	// 尝试解析为新的流式格式（类似OpenAI）
-    	var streamResponse struct {
-    		Type   string `json:"type"`
-    		Index  int    `json:"index"`
-    		Delta  struct {
-    			Type string `json:"type"`
-    			Text string `json:"text"`
-    		} `json:"delta"`
-    		ContentBlock struct {
-    			Type string `json:"type"`
-    			Text string `json:"text"`
-    		} `json:"content_block"`
-    	}
-    	
-    	if err := json.Unmarshal([]byte(dataContent), &streamResponse); err == nil {
-    		text := ""
-    		if streamResponse.Delta.Text != "" {
-    			text = streamResponse.Delta.Text
-    		} else if streamResponse.ContentBlock.Text != "" {
-    			text = streamResponse.ContentBlock.Text
-    		}
-    		
-    		if text != "" {
-    			logrus.Infof("Parsed stream response: text='%s'", text)
-    			message <- PartialResponse{
-    				Text:    text,
-    				RawData: []byte(dataContent),
-    			}
-    			return nil
-    		}
-    	}
-    
-    	// 尝试解析其他可能的格式
-    	var genericResponse map[string]interface{}
-    	if err := json.Unmarshal([]byte(dataContent), &genericResponse); err == nil {
-    		logrus.Infof("Generic response keys: %v", getKeys(genericResponse))
-    		
-    		// 寻找可能包含文本内容的字段
-    		possibleTextFields := []string{"completion", "text", "content", "message"}
-    		for _, field := range possibleTextFields {
-    			if value, exists := genericResponse[field]; exists {
-    				if textValue, ok := value.(string); ok && textValue != "" {
-    					logrus.Infof("Found text in field '%s': %s", field, textValue)
-    					message <- PartialResponse{
-    						Text:    textValue,
-    						RawData: []byte(dataContent),
-    					}
-    					return nil
-    				}
-    			}
-    		}
-    		
-    		// 检查嵌套的delta或content字段
-    		if delta, exists := genericResponse["delta"]; exists {
-    			if deltaMap, ok := delta.(map[string]interface{}); ok {
-    				if text, exists := deltaMap["text"]; exists {
-    					if textValue, ok := text.(string); ok && textValue != "" {
-    						logrus.Infof("Found text in delta.text: %s", textValue)
-    						message <- PartialResponse{
-    							Text:    textValue,
-    							RawData: []byte(dataContent),
-    						}
-    						return nil
-    					}
-    				}
-    			}
-    		}
-    	}
-    
-    	return fmt.Errorf("unable to parse response: %s", dataContent)
-    }
-    
-    // 获取map的所有key
-    func getKeys(m map[string]interface{}) []string {
-    	keys := make([]string, 0, len(m))
-    	for k := range m {
-    		keys = append(keys, k)
-    	}
-    	return keys
-    }
+// 获取map的所有key
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
 
 // 加载默认模型
 func (c *Chat) IsPro() (bool, error) {
@@ -608,23 +798,6 @@ func (c *Chat) getC(o string) (string, error) {
         "model": c.opts.Model,
     }
 
-    // 移除以下代码块
-    /*
-    pro, err := c.IsPro()
-    if err != nil {
-        return "", err
-    }
-
-    if pro {
-        payload["model"] = c.opts.Model
-    } else {
-        if strings.Contains(c.opts.Model, "opus") || strings.Contains(c.opts.Model, "claude-sonnet-4") || strings.Contains(c.opts.Model, "claude-opus-4") {
-            return "", errors.New("failed to used pro model: " + c.opts.Model)
-        }
-        payload["model"] = c.opts.Model
-    }
-    */
-
     response, err := emit.ClientBuilder(c.session).
         POST(baseURL+"/organizations/"+o+"/chat_conversations").
         Ja3().
@@ -655,259 +828,4 @@ func (c *Chat) getC(o string) (string, error) {
     }
 
     return "", errors.New("failed to fetch the conversation")
-}
-
-// 在 chat.go 文件中添加以下函数
-
-// UploadFile 上传文件到Claude
-func (c *Chat) UploadFile(filename string, fileData []byte, contentType string) (string, error) {
-    // 获取组织ID
-    organizationId, err := c.getO()
-    if err != nil {
-        return "", fmt.Errorf("failed to get organization: %v", err)
-    }
-
-    // 创建multipart form
-    var buf bytes.Buffer
-    writer := multipart.NewWriter(&buf)
-    
-    // 添加文件字段
-    part, err := writer.CreateFormFile("file", filename)
-    if err != nil {
-        return "", err
-    }
-    
-    // 如果没有指定content-type，根据文件名猜测
-    if contentType == "" {
-        if strings.HasSuffix(strings.ToLower(filename), ".jpg") || strings.HasSuffix(strings.ToLower(filename), ".jpeg") {
-            contentType = "image/jpeg"
-        } else if strings.HasSuffix(strings.ToLower(filename), ".png") {
-            contentType = "image/png"
-        } else if strings.HasSuffix(strings.ToLower(filename), ".gif") {
-            contentType = "image/gif"
-        } else if strings.HasSuffix(strings.ToLower(filename), ".webp") {
-            contentType = "image/webp"
-        } else {
-            contentType = "application/octet-stream"
-        }
-    }
-    
-    _, err = part.Write(fileData)
-    if err != nil {
-        return "", err
-    }
-    
-    err = writer.Close()
-    if err != nil {
-        return "", err
-    }
-
-    // 发送上传请求
-    uploadURL := fmt.Sprintf("%s/%s/upload", baseURL, organizationId)
-    logrus.Infof("Uploading file to: %s", uploadURL)
-    
-    response, err := emit.ClientBuilder(c.session).
-        POST(uploadURL).
-        Header("content-type", writer.FormDataContentType()).
-        Header("origin", "https://claude.ai").
-        Header("referer", "https://claude.ai/new").
-        Header("user-agent", userAgent).
-        Header("accept", "*/*").
-        Header("accept-language", "en,zh-CN;q=0.9,zh;q=0.8,en-GB;q=0.7,en-US;q=0.6").
-        CookieJar(c.opts.jar).
-        Bytes(buf.Bytes()).
-        DoC(emit.Status(http.StatusOK), emit.IsJSON)
-    
-    if err != nil {
-        return "", fmt.Errorf("upload failed: %v", err)
-    }
-    defer response.Body.Close()
-
-    // 解析响应
-    var uploadResp FileUploadResponse
-    responseBody, _ := io.ReadAll(response.Body)
-    logrus.Debugf("Upload response: %s", string(responseBody))
-    
-    if err := json.Unmarshal(responseBody, &uploadResp); err != nil {
-        return "", fmt.Errorf("failed to parse upload response: %v", err)
-    }
-
-    logrus.Infof("File uploaded successfully: %s (UUID: %s)", uploadResp.FileName, uploadResp.FileUUID)
-
-    // 调用文件处理确认接口 (可选，先跳过测试)
-    // if err := c.confirmFileUpload(uploadResp.FileUUID); err != nil {
-    //     logrus.Warnf("Failed to confirm file upload: %v", err)
-    // }
-
-    return uploadResp.FileUUID, nil
-}
-
-// confirmFileUpload 确认文件上传（对应 /v1/t 请求）
-func (c *Chat) confirmFileUpload(fileUUID string) error {
-    // 这里需要知道具体的请求体格式
-    // 暂时留空，等您提供更多信息
-    
-    // payload := map[string]interface{}{
-    //     "file_uuid": fileUUID,
-    //     // 其他必要字段
-    // }
-    
-    // response, err := emit.ClientBuilder(c.session).
-    //     POST("https://a-api.anthropic.com/v1/t").
-    //     Header("origin", "https://claude.ai").
-    //     Header("referer", "https://claude.ai/new").
-    //     Header("user-agent", userAgent).
-    //     CookieJar(c.opts.jar).
-    //     JHeader().
-    //     Body(payload).
-    //     DoC(emit.Status(http.StatusOK), emit.IsJSON)
-    
-    return nil
-}
-
-func (c *Chat) ReplyWithFiles(ctx context.Context, message string, files []FileAttachment) (chan PartialResponse, error) {
-    // 首先上传所有文件
-    var fileUUIDs []string
-    for _, file := range files {
-        logrus.Infof("Uploading file: %s (%d bytes)", file.FileName, len(file.FileData))
-        uuid, err := c.UploadFile(file.FileName, file.FileData, file.FileType)
-        if err != nil {
-            return nil, fmt.Errorf("failed to upload file %s: %v", file.FileName, err)
-        }
-        fileUUIDs = append(fileUUIDs, uuid)
-    }
-
-    // 使用上传的文件UUID发送消息
-    return c.replyWithFileUUIDs(ctx, message, fileUUIDs)
-}
-
-// replyWithFileUUIDs 使用文件UUID发送消息
-func (c *Chat) replyWithFileUUIDs(ctx context.Context, message string, fileUUIDs []string) (chan PartialResponse, error) {
-    if c.opts.Model == "" {
-        model, err := c.loadModel()
-        if err != nil {
-            return nil, err
-        }
-        c.opts.Model = model
-    }
-
-    c.mu.Lock()
-    logrus.Info("curr model: ", c.opts.Model)
-    
-    var response *http.Response
-    for index := 1; index <= c.opts.Retry; index++ {
-        r, err := c.PostMessageWithFiles(message, nil, fileUUIDs)
-        if err != nil {
-            if index >= c.opts.Retry {
-                c.mu.Unlock()
-                return nil, err
-            }
-            
-            var wap *ErrorWrapper
-            ok := errors.As(err, &wap)
-            
-            if ok && wap.ErrorType.Message == "Invalid model" {
-                c.mu.Unlock()
-                return nil, errors.New(wap.ErrorType.Message)
-            } else {
-                logrus.Error("[retry] ", err)
-            }
-        } else {
-            response = r
-            break
-        }
-    }
-
-    ch := make(chan PartialResponse)
-    go c.resolve(ctx, response, ch)
-    return ch, nil
-}
-
-func (c *Chat) PostMessageWithFiles(message string, attrs []Attachment, fileUUIDs []string) (*http.Response, error) {
-    var (
-        organizationId string
-        conversationId string
-    )
-
-    // 获取组织ID
-    {
-        oid, err := c.getO()
-        if err != nil {
-            return nil, fmt.Errorf("fetch organization failed: %v", err)
-        }
-        organizationId = oid
-    }
-
-    // 获取会话ID
-    {
-        cid, err := c.getC(organizationId)
-        if err != nil {
-            return nil, fmt.Errorf("fetch conversation failed: %v", err)
-        }
-        conversationId = cid
-    }
-
-    // 构建payload
-    payload := map[string]interface{}{
-        "prompt":               message,
-        "parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
-        "timezone":             "Asia/Shanghai",
-        "locale":               "en-US",
-        "rendering_mode":       "messages",
-        "attachments":          []interface{}{},
-        "files":                fileUUIDs, // 添加文件UUID数组
-        "sync_sources":         []interface{}{},
-        "personalized_styles": []map[string]interface{}{
-            {
-                "type":        "default",
-                "key":         "Default",
-                "name":        "Normal",
-                "nameKey":     "normal_style_name",
-                "prompt":      "Normal",
-                "summary":     "Default responses from Claude",
-                "summaryKey":  "normal_style_summary",
-                "isDefault":   true,
-            },
-        },
-        "tools": []map[string]interface{}{
-            {"type": "web_search_v0", "name": "web_search"},
-            {"type": "artifacts_v0", "name": "artifacts"},
-            {"type": "repl_v0", "name": "repl"},
-        },
-    }
-
-    // 设置模型
-    if strings.Contains(c.opts.Model, "claude-3-7") || strings.Contains(c.opts.Model, "claude-3-5") || strings.Contains(c.opts.Model, "claude-3-opus") {
-        payload["model"] = c.opts.Model
-    }
-
-    // 处理附件
-    if len(attrs) > 0 {
-        payload["attachments"] = attrs
-    }
-
-    logrus.Infof("发送请求 - 模型: %s, 文件数: %d, fileUUIDs: %v", c.opts.Model, len(fileUUIDs), fileUUIDs)
-
-    response, err := emit.ClientBuilder(c.session).
-        Ja3().
-        CookieJar(c.opts.jar).
-        POST(baseURL+"/organizations/"+organizationId+"/chat_conversations/"+conversationId+"/completion").
-        Header("referer", "https://claude.ai/chat/"+conversationId).
-        Header("accept", "text/event-stream").
-        Header("anthropic-client-platform", "web_claude_ai").
-        Header("user-agent", userAgent).
-        JHeader().
-        Body(payload).
-        DoC(emit.Status(http.StatusOK), emit.IsSTREAM)
-
-    if err != nil {
-        logrus.Errorf("请求失败 - 模型: %s, 错误: %v", c.opts.Model, err)
-    }
-
-    return response, err
-}
-
-// 保留原有的 PostMessage 函数以保持向后兼容
-func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
-    return c.PostMessageWithFiles(message, attrs, []string{})
 }
