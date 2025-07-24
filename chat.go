@@ -298,7 +298,7 @@ func (c *Chat) ReplyWithFiles(ctx context.Context, message string, fileUUIDs []s
     logrus.Info("curr model: ", c.opts.Model)
     var response *http.Response
     for index := 1; index <= c.opts.Retry; index++ {
-        r, err := c.PostMessageWithFiles(message, fileUUIDs, attachments)
+        r, err := c.PostMessageWithFiles(message, fileUUIDs, attachments)  // 这里修复了，添加了 attachments 参数
         if err != nil {
             if index >= c.opts.Retry {
                 c.mu.Unlock()
