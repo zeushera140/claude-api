@@ -1,7 +1,7 @@
 package claude
 
 import (
-	"fmt"   // 添加这个
+	"fmt"
 	"bufio"
 	"bytes"
 	"context"
@@ -13,6 +13,9 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"io"
+	"mime/multipart"
+	"path/filepath"
 )
 
 var (
@@ -77,6 +80,95 @@ type webClaude2Response struct {
 
 func Ja3(j string) {
 	ja3 = j
+}
+
+// UploadFile 上传文件到Claude
+func (c *Chat) UploadFile(filename string, fileContent []byte) (*UploadResponse, error) {
+	// 获取组织ID
+	organizationId, err := c.getO()
+	if err != nil {
+		return nil, fmt.Errorf("fetch organization failed: %v", err)
+	}
+
+	// 创建multipart请求体
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	
+	// 创建文件字段
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return nil, err
+	}
+	
+	// 写入文件内容
+	_, err = io.Copy(part, bytes.NewReader(fileContent))
+	if err != nil {
+		return nil, err
+	}
+	
+	// 关闭writer以设置boundary
+	err = writer.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	// 发送上传请求
+	response, err := emit.ClientBuilder(c.session).
+		Ja3().
+		CookieJar(c.opts.jar).
+		POST(baseURL+"/"+organizationId+"/upload").
+		Header("content-type", writer.FormDataContentType()).
+		Header("referer", "https://claude.ai/new").
+		Header("origin", "https://claude.ai").
+		Header("user-agent", userAgent).
+		Bytes(body.Bytes()).
+		DoC(emit.Status(http.StatusOK), emit.IsJSON)
+	
+	if err != nil {
+		return nil, fmt.Errorf("upload failed: %v", err)
+	}
+	
+	defer response.Body.Close()
+	
+	// 解析响应
+	var uploadResp UploadResponse
+	if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
+		return nil, fmt.Errorf("parse upload response failed: %v", err)
+	}
+	
+	// 发送上传完成信号到 a-api.anthropic.com
+	err = c.sendUploadSignal()
+	if err != nil {
+		logrus.Warnf("send upload signal failed: %v", err)
+		// 不要因为这个失败而中断流程
+	}
+	
+	return &uploadResp, nil
+}
+
+// sendUploadSignal 发送上传完成信号
+func (c *Chat) sendUploadSignal() error {
+	payload := map[string]bool{
+		"success": true,
+	}
+	
+	response, err := emit.ClientBuilder(c.session).
+		Ja3().
+		CookieJar(c.opts.jar).
+		POST("https://a-api.anthropic.com/v1/t").
+		Header("referer", "https://claude.ai/").
+		Header("origin", "https://claude.ai").
+		Header("user-agent", userAgent).
+		JHeader().
+		Body(payload).
+		DoC(emit.Status(http.StatusOK))
+	
+	if err != nil {
+		return err
+	}
+	
+	response.Body.Close()
+	return nil
 }
 
 func NewDefaultOptions(cookies string, model string, mode string) (*Options, error) {
@@ -215,7 +307,17 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 
 	// 处理附件
 	if len(attrs) > 0 {
-		payload["attachments"] = attrs
+		// 将Attachment转换为适合API的格式
+		attachments := make([]interface{}, 0, len(attrs))
+		for _, attr := range attrs {
+			attachments = append(attachments, map[string]interface{}{
+				"extracted_content": attr.Content,
+				"file_name":        attr.FileName,
+				"file_size":        attr.FileSize,
+				"file_type":        attr.FileType,
+			})
+		}
+		payload["attachments"] = attachments
 	}
 
 	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
