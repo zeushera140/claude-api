@@ -206,7 +206,8 @@ func (c *Chat) Client(session *emit.Session) {
 	c.session = session
 }
 
-func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (chan PartialResponse, error) {
+// 修改 Reply 函数签名，返回上传的文件信息
+func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment, fileUUIDs []string) (chan PartialResponse, error) {
 	if c.opts.Model == "" {
 		// 动态加载 model
 		model, err := c.loadModel()
@@ -220,7 +221,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	logrus.Info("curr model: ", c.opts.Model)
 	var response *http.Response
 	for index := 1; index <= c.opts.Retry; index++ {
-		r, err := c.PostMessage(message, attrs)
+		r, err := c.PostMessage(message, attrs, fileUUIDs)
 		if err != nil {
 			if index >= c.opts.Retry {
 				c.mu.Unlock()
@@ -247,7 +248,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	return ch, nil
 }
 
-func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
+func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []string) (*http.Response, error) {
 	var (
 		organizationId string
 		conversationId string
@@ -271,7 +272,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		conversationId = cid
 	}
 
-	// 构建payload - 兼容新旧格式
+	// 构建payload
 	payload := map[string]interface{}{
 		"prompt":               message,
 		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
@@ -305,9 +306,19 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		payload["model"] = c.opts.Model
 	}
 
+	// 处理文件UUID
+	if len(fileUUIDs) > 0 {
+		files := make([]interface{}, 0, len(fileUUIDs))
+		for _, uuid := range fileUUIDs {
+			files = append(files, map[string]interface{}{
+				"uuid": uuid,
+			})
+		}
+		payload["files"] = files
+	}
+
 	// 处理附件
 	if len(attrs) > 0 {
-		// 将Attachment转换为适合API的格式
 		attachments := make([]interface{}, 0, len(attrs))
 		for _, attr := range attrs {
 			attachments = append(attachments, map[string]interface{}{
