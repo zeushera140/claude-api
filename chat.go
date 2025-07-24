@@ -280,7 +280,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []strin
 		"locale":               "en-US",
 		"rendering_mode":       "messages",
 		"attachments":          []interface{}{},
-		"files":                []interface{}{},
+		"files":                []interface{}{}, // 修改这里
 		"sync_sources":         []interface{}{},
 		"personalized_styles": []map[string]interface{}{
 			{
@@ -306,15 +306,10 @@ func (c *Chat) PostMessage(message string, attrs []Attachment, fileUUIDs []strin
 		payload["model"] = c.opts.Model
 	}
 
-	// 处理文件UUID
+	// 处理文件UUID - 关键修改在这里！
 	if len(fileUUIDs) > 0 {
-		files := make([]interface{}, 0, len(fileUUIDs))
-		for _, uuid := range fileUUIDs {
-			files = append(files, map[string]interface{}{
-				"uuid": uuid,
-			})
-		}
-		payload["files"] = files
+		// 直接将UUID字符串数组赋值给files字段
+		payload["files"] = fileUUIDs
 	}
 
 	// 处理附件
