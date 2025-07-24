@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net/http"
-	"path/filepath"
+	//"path/filepath"
 	"regexp"
 	"strings"
 
