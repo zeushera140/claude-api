@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net/http"
-	//"path/filepath"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -333,7 +333,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 
 // 原始的PostMessage方法，保持向后兼容
 func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
-	return c.PostMessageWithFiles(message, []string{})
+    return c.PostMessageWithFiles(message, []string{})
 }
 
 func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string, attachments []Attachment) (*http.Response, error) {
