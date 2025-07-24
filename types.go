@@ -17,11 +17,13 @@ type Chat struct {
 	session *emit.Session
 }
 
+// 在types.go文件中修改Attachment结构体
 type Attachment struct {
-	Content  string `json:"extracted_content"`
-	FileName string `json:"file_name"`
-	FileSize int    `json:"file_size"`
-	FileType string `json:"file_type"`
+    Content  string `json:"extracted_content"` // 可能为空，取决于文件类型
+    FileName string `json:"file_name"`
+    FileSize int    `json:"file_size"`
+    FileType string `json:"file_type"`
+    FileUUID string `json:"file_uuid,omitempty"` // 新增字段，用于引用已上传的文件
 }
 
 type Options struct {
