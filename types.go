@@ -17,6 +17,35 @@ type Chat struct {
 	session *emit.Session
 }
 
+// UploadResponse 文件上传响应
+type UploadResponse struct {
+	FileKind      string         `json:"file_kind"`
+	FileUUID      string         `json:"file_uuid"`
+	FileName      string         `json:"file_name"`
+	CreatedAt     string         `json:"created_at"`
+	ThumbnailURL  string         `json:"thumbnail_url"`
+	PreviewURL    string         `json:"preview_url"`
+	ThumbnailAsset *AssetInfo    `json:"thumbnail_asset,omitempty"`
+	PreviewAsset   *AssetInfo    `json:"preview_asset,omitempty"`
+}
+
+// AssetInfo 资源信息
+type AssetInfo struct {
+	URL          string `json:"url"`
+	FileVariant  string `json:"file_variant"`
+	PrimaryColor string `json:"primary_color"`
+	ImageWidth   int    `json:"image_width"`
+	ImageHeight  int    `json:"image_height"`
+}
+
+// FileAttachment 文件附件信息（用于发送消息时）
+type FileAttachment struct {
+	FileUUID     string `json:"file_uuid"`
+	FileName     string `json:"file_name"`
+	FileType     string `json:"file_type"`
+	ExtractedContent string `json:"extracted_content,omitempty"`
+}
+
 // 在types.go文件中修改Attachment结构体
 type Attachment struct {
     Content  string `json:"extracted_content"` // 可能为空，取决于文件类型
