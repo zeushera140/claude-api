@@ -2,6 +2,7 @@ package claude
 
 import (
 	"fmt"   // 添加这个
+	"io"
 	"bufio"
 	"bytes"
 	"context"
