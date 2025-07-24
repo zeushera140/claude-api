@@ -1,18 +1,21 @@
 package claude
 
 import (
-	"fmt"   // 添加这个
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"mime/multipart"
+	"net/http"
+	"path/filepath"
+	"regexp"
+	"strings"
+
 	"github.com/bincooo/emit.io"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
-	"net/http"
-	"regexp"
-	"strings"
 )
 
 var (
@@ -75,30 +78,65 @@ type webClaude2Response struct {
 	} `json:"messageLimit"`
 }
 
+// 文件上传响应结构
+type FileUploadResponse struct {
+	FileKind      string        `json:"file_kind"`
+	FileUUID      string        `json:"file_uuid"`
+	FileName      string        `json:"file_name"`
+	CreatedAt     string        `json:"created_at"`
+	ThumbnailURL  string        `json:"thumbnail_url"`
+	PreviewURL    string        `json:"preview_url"`
+	ThumbnailAsset *AssetInfo   `json:"thumbnail_asset,omitempty"`
+	PreviewAsset   *AssetInfo   `json:"preview_asset,omitempty"`
+}
+
+type AssetInfo struct {
+	URL         string `json:"url"`
+	FileVariant string `json:"file_variant"`
+	PrimaryColor string `json:"primary_color"`
+	ImageWidth   int    `json:"image_width"`
+	ImageHeight  int    `json:"image_height"`
+}
+
+// 添加新的响应结构体
+type ContentBlockDelta struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+}
+
+type NewClaudeResponse struct {
+	Type        string             `json:"type"`
+	Index       int               `json:"index,omitempty"`
+	Delta       *ContentBlockDelta `json:"delta,omitempty"`
+	Message     interface{}       `json:"message,omitempty"`
+	ContentBlock interface{}      `json:"content_block,omitempty"`
+}
+
 func Ja3(j string) {
 	ja3 = j
 }
 
 func NewDefaultOptions(cookies string, model string, mode string) (*Options, error) {
-    options := Options{
-        Retry: 2,
-        Model: model,
-        Mode:  mode, // Add mode parameter
-    }
+	options := Options{
+		Retry: 2,
+		Model: model,
+		Mode:  mode,
+	}
 
-    if cookies != "" {
-        if !strings.Contains(cookies, "sessionKey=") {
-            cookies = "sessionKey=" + cookies
-        }
+	if cookies != "" {
+		if !strings.Contains(cookies, "sessionKey=") {
+			cookies = "sessionKey=" + cookies
+		}
 
-        jar, err := emit.NewCookieJar("https://claude.ai", cookies)
-        if err != nil {
-            return nil, err
-        }
-        options.jar = jar
-    }
+		jar, err := emit.NewCookieJar("https://claude.ai", cookies)
+		if err != nil {
+			return nil, err
+		}
+		options.jar = jar
+	}
 
-    return &options, nil
+	return &options, nil
 }
 
 func New(opts *Options) (*Chat, error) {
@@ -114,7 +152,13 @@ func (c *Chat) Client(session *emit.Session) {
 	c.session = session
 }
 
+// 原始的Reply方法，保持向后兼容
 func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (chan PartialResponse, error) {
+	return c.ReplyWithFiles(ctx, message, []string{})
+}
+
+// 新的ReplyWithFiles方法，支持文件UUID
+func (c *Chat) ReplyWithFiles(ctx context.Context, message string, fileUUIDs []string) (chan PartialResponse, error) {
 	if c.opts.Model == "" {
 		// 动态加载 model
 		model, err := c.loadModel()
@@ -128,7 +172,7 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	logrus.Info("curr model: ", c.opts.Model)
 	var response *http.Response
 	for index := 1; index <= c.opts.Retry; index++ {
-		r, err := c.PostMessage(message, attrs)
+		r, err := c.PostMessageWithFiles(message, fileUUIDs)
 		if err != nil {
 			if index >= c.opts.Retry {
 				c.mu.Unlock()
@@ -155,7 +199,13 @@ func (c *Chat) Reply(ctx context.Context, message string, attrs []Attachment) (c
 	return ch, nil
 }
 
+// 原始的PostMessage方法，保持向后兼容
 func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, error) {
+	return c.PostMessageWithFiles(message, []string{})
+}
+
+// 新的PostMessageWithFiles方法
+func (c *Chat) PostMessageWithFiles(message string, fileUUIDs []string) (*http.Response, error) {
 	var (
 		organizationId string
 		conversationId string
@@ -179,7 +229,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		conversationId = cid
 	}
 
-	// 构建payload - 兼容新旧格式
+	// 构建payload
 	payload := map[string]interface{}{
 		"prompt":               message,
 		"parent_message_uuid":  "00000000-0000-4000-8000-000000000000",
@@ -187,7 +237,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		"locale":               "en-US",
 		"rendering_mode":       "messages",
 		"attachments":          []interface{}{},
-		"files":                []interface{}{},
+		"files":                fileUUIDs,
 		"sync_sources":         []interface{}{},
 		"personalized_styles": []map[string]interface{}{
 			{
@@ -213,12 +263,7 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 		payload["model"] = c.opts.Model
 	}
 
-	// 处理附件
-	if len(attrs) > 0 {
-		payload["attachments"] = attrs
-	}
-
-	logrus.Infof("发送请求 - 模型: %s, payload: %+v", c.opts.Model, payload)
+	logrus.Infof("发送请求 - 模型: %s, 文件数: %d", c.opts.Model, len(fileUUIDs))
 
 	response, err := emit.ClientBuilder(c.session).
 		Ja3().
@@ -237,6 +282,94 @@ func (c *Chat) PostMessage(message string, attrs []Attachment) (*http.Response, 
 	}
 
 	return response, err
+}
+
+// 文件上传方法
+func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) (*FileUploadResponse, error) {
+	// 获取文件类型信息
+	fileInfo := GetFileTypeInfo(fileName)
+	if contentType == "" {
+		contentType = fileInfo.MimeType
+	}
+	
+	// 检查文件大小
+	maxSize := GetMaxFileSizeForType(fileInfo.FileKind)
+	if int64(len(fileData)) > maxSize {
+		return nil, fmt.Errorf("file size %d exceeds maximum allowed size %d for %s files", 
+			len(fileData), maxSize, fileInfo.FileKind)
+	}
+	
+	// 获取组织ID
+	oid, err := c.getO()
+	if err != nil {
+		return nil, fmt.Errorf("fetch organization failed: %v", err)
+	}
+
+	// 创建multipart writer
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	
+	// 创建文件字段
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return nil, err
+	}
+	
+	// 写入文件数据
+	if _, err := part.Write(fileData); err != nil {
+		return nil, err
+	}
+	
+	// 关闭writer
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	
+	logrus.Infof("Uploading file: %s (type: %s, kind: %s, size: %d bytes)", 
+		fileName, contentType, fileInfo.FileKind, len(fileData))
+	
+	// 发送请求
+	response, err := emit.ClientBuilder(c.session).
+		POST(baseURL+"/"+oid+"/upload").
+		Ja3().
+		CookieJar(c.opts.jar).
+		Header("content-type", writer.FormDataContentType()).
+		Header("origin", "https://claude.ai").
+		Header("referer", "https://claude.ai/new").
+		Header("anthropic-client-platform", "web_claude_ai").
+		Header("user-agent", userAgent).
+		Bytes(body.Bytes()).
+		DoC(emit.Status(http.StatusOK), emit.IsJSON)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	defer response.Body.Close()
+	
+	var uploadResp FileUploadResponse
+	if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
+		return nil, err
+	}
+	
+	logrus.Infof("File uploaded successfully: UUID=%s, Kind=%s", uploadResp.FileUUID, uploadResp.FileKind)
+	
+	return &uploadResp, nil
+}
+
+// 批量上传文件的便捷方法
+func (c *Chat) UploadFiles(files map[string][]byte) ([]*FileUploadResponse, error) {
+	var responses []*FileUploadResponse
+	
+	for fileName, fileData := range files {
+		resp, err := c.UploadFile(fileName, fileData, "")
+		if err != nil {
+			return responses, fmt.Errorf("failed to upload %s: %v", fileName, err)
+		}
+		responses = append(responses, resp)
+	}
+	
+	return responses, nil
 }
 
 func (c *Chat) Delete() {
@@ -263,21 +396,6 @@ func (c *Chat) Delete() {
 	}
 }
 
-	// 添加新的响应结构体
-type ContentBlockDelta struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Thinking string `json:"thinking,omitempty"`
-}
-
-type NewClaudeResponse struct {
-	Type        string             `json:"type"`
-	Index       int               `json:"index,omitempty"`
-	Delta       *ContentBlockDelta `json:"delta,omitempty"`
-	Message     interface{}       `json:"message,omitempty"`
-	ContentBlock interface{}      `json:"content_block,omitempty"`
-}
-
 func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan PartialResponse) {
 	defer c.mu.Unlock()
 	defer close(message)
@@ -299,7 +417,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 	logrus.Infof("Response Headers: %+v", r.Header)
 	
 	eventCount := 0
-	var currentText strings.Builder // 累积文本内容
+	var currentText strings.Builder
 	
 	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
 		if eof && len(data) == 0 {
@@ -372,7 +490,6 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 					textContent = response.Delta.Text
 					currentText.WriteString(textContent)
 				} else if response.Delta.Type == "thinking_delta" && response.Delta.Thinking != "" {
-					// 对于thinking内容，我们可以选择是否包含
 					textContent = response.Delta.Thinking
 					currentText.WriteString(textContent)
 				}
@@ -447,106 +564,106 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		}
 	}
 }
-    
-    // 解析响应并发送消息的辅助函数
-    func (c *Chat) parseAndSendResponse(dataContent string, message chan PartialResponse) error {
-    	if strings.TrimSpace(dataContent) == "" || dataContent == "[DONE]" {
-    		return nil
-    	}
-    
-    	// 尝试解析为原始webClaude2Response格式
-    	var response webClaude2Response
-    	if err := json.Unmarshal([]byte(dataContent), &response); err == nil && response.Completion != "" {
-    		logrus.Infof("Parsed webClaude2Response: completion='%s', stop_reason='%s'", response.Completion, response.StopReason)
-    		message <- PartialResponse{
-    			Text:    response.Completion,
-    			RawData: []byte(dataContent),
-    		}
-    		return nil
-    	}
-    
-    	// 尝试解析为新的流式格式（类似OpenAI）
-    	var streamResponse struct {
-    		Type   string `json:"type"`
-    		Index  int    `json:"index"`
-    		Delta  struct {
-    			Type string `json:"type"`
-    			Text string `json:"text"`
-    		} `json:"delta"`
-    		ContentBlock struct {
-    			Type string `json:"type"`
-    			Text string `json:"text"`
-    		} `json:"content_block"`
-    	}
-    	
-    	if err := json.Unmarshal([]byte(dataContent), &streamResponse); err == nil {
-    		text := ""
-    		if streamResponse.Delta.Text != "" {
-    			text = streamResponse.Delta.Text
-    		} else if streamResponse.ContentBlock.Text != "" {
-    			text = streamResponse.ContentBlock.Text
-    		}
-    		
-    		if text != "" {
-    			logrus.Infof("Parsed stream response: text='%s'", text)
-    			message <- PartialResponse{
-    				Text:    text,
-    				RawData: []byte(dataContent),
-    			}
-    			return nil
-    		}
-    	}
-    
-    	// 尝试解析其他可能的格式
-    	var genericResponse map[string]interface{}
-    	if err := json.Unmarshal([]byte(dataContent), &genericResponse); err == nil {
-    		logrus.Infof("Generic response keys: %v", getKeys(genericResponse))
-    		
-    		// 寻找可能包含文本内容的字段
-    		possibleTextFields := []string{"completion", "text", "content", "message"}
-    		for _, field := range possibleTextFields {
-    			if value, exists := genericResponse[field]; exists {
-    				if textValue, ok := value.(string); ok && textValue != "" {
-    					logrus.Infof("Found text in field '%s': %s", field, textValue)
-    					message <- PartialResponse{
-    						Text:    textValue,
-    						RawData: []byte(dataContent),
-    					}
-    					return nil
-    				}
-    			}
-    		}
-    		
-    		// 检查嵌套的delta或content字段
-    		if delta, exists := genericResponse["delta"]; exists {
-    			if deltaMap, ok := delta.(map[string]interface{}); ok {
-    				if text, exists := deltaMap["text"]; exists {
-    					if textValue, ok := text.(string); ok && textValue != "" {
-    						logrus.Infof("Found text in delta.text: %s", textValue)
-    						message <- PartialResponse{
-    							Text:    textValue,
-    							RawData: []byte(dataContent),
-    						}
-    						return nil
-    					}
-    				}
-    			}
-    		}
-    	}
-    
-    	return fmt.Errorf("unable to parse response: %s", dataContent)
-    }
-    
-    // 获取map的所有key
-    func getKeys(m map[string]interface{}) []string {
-    	keys := make([]string, 0, len(m))
-    	for k := range m {
-    		keys = append(keys, k)
-    	}
-    	return keys
-    }
 
-// 加载默认模型
+// 解析响应并发送消息的辅助函数
+func (c *Chat) parseAndSendResponse(dataContent string, message chan PartialResponse) error {
+	if strings.TrimSpace(dataContent) == "" || dataContent == "[DONE]" {
+		return nil
+	}
+
+	// 尝试解析为原始webClaude2Response格式
+	var response webClaude2Response
+	if err := json.Unmarshal([]byte(dataContent), &response); err == nil && response.Completion != "" {
+		logrus.Infof("Parsed webClaude2Response: completion='%s', stop_reason='%s'", response.Completion, response.StopReason)
+		message <- PartialResponse{
+			Text:    response.Completion,
+			RawData: []byte(dataContent),
+		}
+		return nil
+	}
+
+	// 尝试解析为新的流式格式（类似OpenAI）
+	var streamResponse struct {
+		Type   string `json:"type"`
+		Index  int    `json:"index"`
+		Delta  struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
+		ContentBlock struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_block"`
+	}
+	
+	if err := json.Unmarshal([]byte(dataContent), &streamResponse); err == nil {
+		text := ""
+		if streamResponse.Delta.Text != "" {
+			text = streamResponse.Delta.Text
+		} else if streamResponse.ContentBlock.Text != "" {
+			text = streamResponse.ContentBlock.Text
+		}
+		
+		if text != "" {
+			logrus.Infof("Parsed stream response: text='%s'", text)
+			message <- PartialResponse{
+				Text:    text,
+				RawData: []byte(dataContent),
+			}
+			return nil
+		}
+	}
+
+	// 尝试解析其他可能的格式
+	var genericResponse map[string]interface{}
+	if err := json.Unmarshal([]byte(dataContent), &genericResponse); err == nil {
+		logrus.Infof("Generic response keys: %v", getKeys(genericResponse))
+		
+		// 寻找可能包含文本内容的字段
+		possibleTextFields := []string{"completion", "text", "content", "message"}
+		for _, field := range possibleTextFields {
+			if value, exists := genericResponse[field]; exists {
+				if textValue, ok := value.(string); ok && textValue != "" {
+					logrus.Infof("Found text in field '%s': %s", field, textValue)
+					message <- PartialResponse{
+						Text:    textValue,
+						RawData: []byte(dataContent),
+					}
+					return nil
+				}
+			}
+		}
+		
+		// 检查嵌套的delta或content字段
+		if delta, exists := genericResponse["delta"]; exists {
+			if deltaMap, ok := delta.(map[string]interface{}); ok {
+				if text, exists := deltaMap["text"]; exists {
+					if textValue, ok := text.(string); ok && textValue != "" {
+						logrus.Infof("Found text in delta.text: %s", textValue)
+						message <- PartialResponse{
+							Text:    textValue,
+							RawData: []byte(dataContent),
+						}
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	return fmt.Errorf("unable to parse response: %s", dataContent)
+}
+
+// 获取map的所有key
+func getKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// 检查是否为Pro用户
 func (c *Chat) IsPro() (bool, error) {
 	o, err := c.getO()
 	if err != nil {
@@ -575,72 +692,72 @@ func (c *Chat) IsPro() (bool, error) {
 
 // 加载默认模型
 func (c *Chat) loadModel() (string, error) {
-    o, err := c.getO()
-    if err != nil {
-        return "", err
-    }
+	o, err := c.getO()
+	if err != nil {
+		return "", err
+	}
 
-    response, err := emit.ClientBuilder(c.session).
-        GET(baseURL+"/bootstrap/"+o+"/statsig").
-        Ja3().
-        CookieJar(c.opts.jar).
-        Header("Origin", "https://claude.ai").
-        Header("Referer", "https://claude.ai/").
-        Header("Accept-Language", "en-US,en;q=0.9").
-        Header("user-agent", userAgent).
-        DoC(emit.Status(http.StatusOK), emit.IsJSON)
-    if err != nil {
-        return "", err
-    }
+	response, err := emit.ClientBuilder(c.session).
+		GET(baseURL+"/bootstrap/"+o+"/statsig").
+		Ja3().
+		CookieJar(c.opts.jar).
+		Header("Origin", "https://claude.ai").
+		Header("Referer", "https://claude.ai/").
+		Header("Accept-Language", "en-US,en;q=0.9").
+		Header("user-agent", userAgent).
+		DoC(emit.Status(http.StatusOK), emit.IsJSON)
+	if err != nil {
+		return "", err
+	}
 
-    defer response.Body.Close()
-    responseBody := emit.TextResponse(response)
-    
-    // First try to find models array using regex
-    modelsRegex := regexp.MustCompile(`"models":\[\{"model":"(claude-[^"]+)"`)
-    matchArr := modelsRegex.FindStringSubmatch(responseBody)
-    if len(matchArr) > 0 {
-        return matchArr[1], nil
-    }
-    
-    // If that fails, try parsing the JSON
-    var responseData map[string]interface{}
-    if err := json.Unmarshal([]byte(responseBody), &responseData); err == nil {
-        if statsig, ok := responseData["statsig"].(map[string]interface{}); ok {
-            if values, ok := statsig["values"].(map[string]interface{}); ok {
-                // Search for any value containing a models array
-                for _, v := range values {
-                    if valueObj, ok := v.(map[string]interface{}); ok {
-                        if valueValue, ok := valueObj["value"].(map[string]interface{}); ok {
-                            if models, ok := valueValue["models"].([]interface{}); ok && len(models) > 0 {
-                                if modelObj, ok := models[0].(map[string]interface{}); ok {
-                                    if modelName, ok := modelObj["model"].(string); ok {
-                                        return modelName, nil
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Fall back to old regex as last resort
-    oldRegex := regexp.MustCompile(`"value":{"model":"(claude-[^"]+)"}`)
-    matchArr = oldRegex.FindStringSubmatch(responseBody)
-    if len(matchArr) > 0 {
-        return matchArr[1], nil
-    }
-    
-    // Try one more pattern as last resort
-    simpleRegex := regexp.MustCompile(`"model":"(claude-[^"]+)"`)
-    matchArr = simpleRegex.FindStringSubmatch(responseBody)
-    if len(matchArr) > 0 {
-        return matchArr[1], nil
-    }
-    
-    return "", errors.New("failed to fetch the model from the conversation")
+	defer response.Body.Close()
+	responseBody := emit.TextResponse(response)
+	
+	// First try to find models array using regex
+	modelsRegex := regexp.MustCompile(`"models":\[\{"model":"(claude-[^"]+)"`)
+	matchArr := modelsRegex.FindStringSubmatch(responseBody)
+	if len(matchArr) > 0 {
+		return matchArr[1], nil
+	}
+	
+	// If that fails, try parsing the JSON
+	var responseData map[string]interface{}
+	if err := json.Unmarshal([]byte(responseBody), &responseData); err == nil {
+		if statsig, ok := responseData["statsig"].(map[string]interface{}); ok {
+			if values, ok := statsig["values"].(map[string]interface{}); ok {
+				// Search for any value containing a models array
+				for _, v := range values {
+					if valueObj, ok := v.(map[string]interface{}); ok {
+						if valueValue, ok := valueObj["value"].(map[string]interface{}); ok {
+							if models, ok := valueValue["models"].([]interface{}); ok && len(models) > 0 {
+								if modelObj, ok := models[0].(map[string]interface{}); ok {
+									if modelName, ok := modelObj["model"].(string); ok {
+										return modelName, nil
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Fall back to old regex as last resort
+	oldRegex := regexp.MustCompile(`"value":{"model":"(claude-[^"]+)"}`)
+	matchArr = oldRegex.FindStringSubmatch(responseBody)
+	if len(matchArr) > 0 {
+		return matchArr[1], nil
+	}
+	
+	// Try one more pattern as last resort
+	simpleRegex := regexp.MustCompile(`"model":"(claude-[^"]+)"`)
+	matchArr = simpleRegex.FindStringSubmatch(responseBody)
+	if len(matchArr) > 0 {
+		return matchArr[1], nil
+	}
+	
+	return "", errors.New("failed to fetch the model from the conversation")
 }
 
 func (c *Chat) getO() (string, error) {
@@ -675,150 +792,45 @@ func (c *Chat) getO() (string, error) {
 	return "", errors.New("failed to fetch the organization")
 }
 
-// 在chat.go文件中修改getC函数
 func (c *Chat) getC(o string) (string, error) {
-    if c.cid != "" {
-        return c.cid, nil
-    }
+	if c.cid != "" {
+		return c.cid, nil
+	}
 
-    payload := map[string]interface{}{
-        "name": "",
-        "uuid": uuid.New().String(),
-        // 直接指定模型，无需检查用户是否为pro
-        "model": c.opts.Model,
-    }
+	payload := map[string]interface{}{
+		"name": "",
+		"uuid": uuid.New().String(),
+		"model": c.opts.Model,
+	}
 
-    // 移除以下代码块
-    /*
-    pro, err := c.IsPro()
-    if err != nil {
-        return "", err
-    }
+	response, err := emit.ClientBuilder(c.session).
+		POST(baseURL+"/organizations/"+o+"/chat_conversations").
+		Ja3().
+		CookieJar(c.opts.jar).
+		JHeader().
+		Header("Origin", "https://claude.ai").
+		Header("Referer", "https://claude.ai/").
+		Header("Accept-Language", "en-US,en;q=0.9").
+		Header("user-agent", userAgent).
+		Body(payload).
+		DoC(emit.Status(http.StatusCreated), emit.IsJSON)
 
-    if pro {
-        payload["model"] = c.opts.Model
-    } else {
-        if strings.Contains(c.opts.Model, "opus") || strings.Contains(c.opts.Model, "claude-sonnet-4") || strings.Contains(c.opts.Model, "claude-opus-4") {
-            return "", errors.New("failed to used pro model: " + c.opts.Model)
-        }
-        payload["model"] = c.opts.Model
-    }
-    */
+	if err != nil {
+		return "", err
+	}
 
-    response, err := emit.ClientBuilder(c.session).
-        POST(baseURL+"/organizations/"+o+"/chat_conversations").
-        Ja3().
-        CookieJar(c.opts.jar).
-        JHeader().
-        Header("Origin", "https://claude.ai").
-        Header("Referer", "https://claude.ai/").
-        Header("Accept-Language", "en-US,en;q=0.9").
-        Header("user-agent", userAgent).
-        Body(payload).
-        DoC(emit.Status(http.StatusCreated), emit.IsJSON)
+	defer response.Body.Close()
+	result, err := emit.ToMap(response)
+	if err != nil {
+		return "", err
+	}
 
-    if err != nil {
-        return "", err
-    }
+	if uid, ok := result["uuid"]; ok {
+		if u, okey := uid.(string); okey {
+			c.cid = u
+			return u, nil
+		}
+	}
 
-    defer response.Body.Close()
-    result, err := emit.ToMap(response)
-    if err != nil {
-        return "", err
-    }
-
-    if uid, ok := result["uuid"]; ok {
-        if u, okey := uid.(string); okey {
-            c.cid = u
-            return u, nil
-        }
-    }
-
-    return "", errors.New("failed to fetch the conversation")
-}
-
-func (c *Chat) UploadFile(fileName string, fileData []byte, contentType string) (*FileUploadResponse, error) {
-    // 获取文件类型信息
-    fileInfo := GetFileTypeInfo(fileName)
-    if contentType == "" {
-        contentType = fileInfo.MimeType
-    }
-    
-    // 检查文件大小
-    maxSize := GetMaxFileSizeForType(fileInfo.FileKind)
-    if int64(len(fileData)) > maxSize {
-        return nil, fmt.Errorf("file size %d exceeds maximum allowed size %d for %s files", 
-            len(fileData), maxSize, fileInfo.FileKind)
-    }
-    
-    // 获取组织ID
-    oid, err := c.getO()
-    if err != nil {
-        return nil, fmt.Errorf("fetch organization failed: %v", err)
-    }
-
-    // 创建multipart writer
-    body := &bytes.Buffer{}
-    writer := multipart.NewWriter(body)
-    
-    // 创建文件字段
-    part, err := writer.CreateFormFile("file", fileName)
-    if err != nil {
-        return nil, err
-    }
-    
-    // 写入文件数据
-    if _, err := part.Write(fileData); err != nil {
-        return nil, err
-    }
-    
-    // 关闭writer
-    if err := writer.Close(); err != nil {
-        return nil, err
-    }
-    
-    logrus.Infof("Uploading file: %s (type: %s, kind: %s, size: %d bytes)", 
-        fileName, contentType, fileInfo.FileKind, len(fileData))
-    
-    // 发送请求
-    response, err := emit.ClientBuilder(c.session).
-        POST(baseURL+"/"+oid+"/upload").
-        Ja3().
-        CookieJar(c.opts.jar).
-        Header("content-type", writer.FormDataContentType()).
-        Header("origin", "https://claude.ai").
-        Header("referer", "https://claude.ai/new").
-        Header("anthropic-client-platform", "web_claude_ai").
-        Header("user-agent", userAgent).
-        Bytes(body.Bytes()).
-        DoC(emit.Status(http.StatusOK), emit.IsJSON)
-    
-    if err != nil {
-        return nil, err
-    }
-    
-    defer response.Body.Close()
-    
-    var uploadResp FileUploadResponse
-    if err := json.NewDecoder(response.Body).Decode(&uploadResp); err != nil {
-        return nil, err
-    }
-    
-    logrus.Infof("File uploaded successfully: UUID=%s, Kind=%s", uploadResp.FileUUID, uploadResp.FileKind)
-    
-    return &uploadResp, nil
-}
-
-func (c *Chat) UploadFiles(files map[string][]byte) ([]*FileUploadResponse, error) {
-    var responses []*FileUploadResponse
-    
-    for fileName, fileData := range files {
-        resp, err := c.UploadFile(fileName, fileData, "")
-        if err != nil {
-            return responses, fmt.Errorf("failed to upload %s: %v", fileName, err)
-        }
-        responses = append(responses, resp)
-    }
-    
-    return responses, nil
+	return "", errors.New("failed to fetch the conversation")
 }
