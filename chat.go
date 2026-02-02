@@ -588,7 +588,9 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		logrus.Trace("--------- ORIGINAL MESSAGE ---------")
 		logrus.Trace(data)
 
-		if len(data) < 7 || data[:7] != prefix1 {
+		// 去除首尾空白字符，处理 \r\n 问题
+		data = strings.TrimSpace(data)
+		if len(data) < 7 || !strings.HasPrefix(data, "event: ") {
 			logrus.Debugf("Skipping non-event line: %s", data)
 			return false
 		}
