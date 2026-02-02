@@ -592,7 +592,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 			logrus.Debugf("Skipping non-event line: %s", data)
 			return false
 		}
-		event = data[7:]
+		event = strings.TrimSpace(data[7:])
 		logrus.Infof("Event type: %s", event)
 
 		if !scanner.Scan() {
