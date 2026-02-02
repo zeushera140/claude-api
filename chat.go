@@ -552,7 +552,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 	}
 
 	var (
-		prefix1 = "event: "
+		
 		prefix2 = []byte("data: ")
 	)
 
