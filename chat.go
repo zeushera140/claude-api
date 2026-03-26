@@ -535,8 +535,11 @@ func (c *Chat) Delete() {
 		Header("user-agent", userAgent).
 		Bytes([]byte(`"`+c.cid+`"`)).
 		DoC(emit.Status(http.StatusOK), emit.IsJSON)
-	if err != nil {
+	// Fix: 删除成功时才清空 cid，避免重复删除或泄漏会话
+	if err == nil {
 		c.cid = ""
+	} else {
+		logrus.Warnf("Delete conversation failed (cid=%s): %v", c.cid, err)
 	}
 }
 
@@ -551,18 +554,16 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		}()
 	}
 
-	var (
-		
-		prefix2 = []byte("data: ")
-	)
+	prefix2 := []byte("data: ")
 
 	scanner := bufio.NewScanner(r.Body)
+	// Fix: 将默认 64KB 缓冲区扩大到 4MB，防止大段回复被截断导致回复不完整
+	const maxScanBuf = 4 * 1024 * 1024
+	scanner.Buffer(make([]byte, maxScanBuf), maxScanBuf)
+
 	logrus.Infof("Response Status: %s", r.Status)
 	logrus.Infof("Response Headers: %+v", r.Header)
-	
-	eventCount := 0
-	var currentText strings.Builder
-	
+
 	scanner.Split(func(data []byte, eof bool) (advance int, token []byte, err error) {
 		if eof && len(data) == 0 {
 			return 0, nil, nil
@@ -576,138 +577,128 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		return 0, nil, nil
 	})
 
-	// 处理事件的函数
-	handler := func() bool {
-		if !scanner.Scan() {
-			logrus.Warnf("Scanner stopped. Events processed: %d", eventCount)
-			return true
-		}
-
-		var event string
-		data := scanner.Text()
-		logrus.Trace("--------- ORIGINAL MESSAGE ---------")
-		logrus.Trace(data)
-
-		// 去除首尾空白字符，处理 \r\n 问题
-		data = strings.TrimSpace(data)
-		if len(data) < 7 || !strings.HasPrefix(data, "event: ") {
-			logrus.Debugf("Skipping non-event line: %s", data)
-			return false
-		}
-		event = strings.TrimSpace(data[7:])
-		logrus.Infof("Event type: %s", event)
-
-		if !scanner.Scan() {
-			logrus.Warn("Failed to read data line after event")
-			return true
-		}
-
-		dataBytes := scanner.Bytes()
-		logrus.Trace("--------- DATA ---------")
-		logrus.Trace(string(dataBytes))
-		
-		if len(dataBytes) < 6 || !bytes.HasPrefix(dataBytes, prefix2) {
-			logrus.Debugf("Invalid data format: %s", string(dataBytes))
-			return false
-		}
-
-		eventCount++
-
-		// 处理不同的事件类型
-		switch event {
-		case "message_start":
-			logrus.Debug("Message started")
-			return false
-			
-		case "content_block_start":
-			logrus.Debug("Content block started")
-			return false
-			
-		case "content_block_delta":
-			var response MessageResponse
-			if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
-				logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
-				return false
-			}
-
-			var textContent string
-			if response.Delta != nil {
-				if response.Delta.Type == "text_delta" && response.Delta.Text != "" {
-					textContent = response.Delta.Text
-					currentText.WriteString(textContent)
-				} else if response.Delta.Type == "thinking_delta" && response.Delta.Thinking != "" {
-					textContent = response.Delta.Thinking
-					currentText.WriteString(textContent)
-				}
-			}
-
-			if textContent != "" {
-				message <- PartialResponse{
-					Text:    textContent,
-					RawData: dataBytes[6:],
-				}
-			}
-			return false
-			
-		case "content_block_stop":
-			logrus.Debug("Content block stopped")
-			return false
-			
-		case "message_delta":
-			var response MessageResponse
-			if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
-				logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
-				return false
-			}
-			logrus.Debug("Message delta received")
-			return false
-			
-		case "message_stop":
-			logrus.Info("Message completed")
-			return true
-			
-		case "error":
-			logrus.Errorf("Received error event: %s", string(dataBytes[6:]))
-			message <- PartialResponse{
-				Error: fmt.Errorf("server error: %s", string(dataBytes[6:])),
-			}
-			return true
-			
-		case "completion":
-			// 兼容旧格式
-			var response webClaude2Response
-			if err := json.Unmarshal(dataBytes[6:], &response); err != nil {
-				logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(dataBytes[6:]))
-				return false
-			}
-
-			message <- PartialResponse{
-				Text:    response.Completion,
-				RawData: dataBytes[6:],
-			}
-
-			return response.StopReason == "stop_sequence"
-			
-		default:
-			logrus.Warnf("Unknown event type: %s, data: %s", event, string(dataBytes[6:]))
-			return false
-		}
+	// Fix: 将阻塞的 scanner 移到独立 goroutine，使 ctx.Done() 能被及时响应
+	// 而不是只在每两次 Scan() 调用之间才有机会检测到取消信号
+	type scanResult struct {
+		done bool // true 表示本次事件要求终止流
 	}
+	resultCh := make(chan scanResult, 1)
+	eventCount := 0
 
-	for {
-		select {
-		case <-ctx.Done():
-			logrus.Warnf("Context timeout. Events processed: %d", eventCount)
-			message <- PartialResponse{
-				Error: errors.New("resolve timeout"),
-			}
-			return
-		default:
-			if handler() {
-				logrus.Infof("Handler returned true, ending stream. Total events: %d", eventCount)
+	// 扫描 goroutine：持续读取 SSE 事件并将结果写入 resultCh
+	go func() {
+		defer close(resultCh)
+		for {
+			// 读 event 行
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					logrus.Errorf("Scanner error after %d events: %v", eventCount, err)
+					message <- PartialResponse{Error: fmt.Errorf("scanner error: %w", err)}
+				} else {
+					logrus.Infof("Scanner EOF. Events processed: %d", eventCount)
+				}
+				resultCh <- scanResult{done: true}
 				return
 			}
+
+			line := strings.TrimSpace(scanner.Text())
+			logrus.Trace("--------- ORIGINAL LINE ---------")
+			logrus.Trace(line)
+
+			if len(line) < 7 || !strings.HasPrefix(line, "event: ") {
+				logrus.Debugf("Skipping non-event line: %s", line)
+				continue
+			}
+			event := strings.TrimSpace(line[7:])
+			logrus.Infof("Event type: %s", event)
+
+			// 读 data 行
+			if !scanner.Scan() {
+				logrus.Warn("Failed to read data line after event")
+				resultCh <- scanResult{done: true}
+				return
+			}
+			dataBytes := scanner.Bytes()
+			logrus.Trace("--------- DATA ---------")
+			logrus.Trace(string(dataBytes))
+
+			if len(dataBytes) < 6 || !bytes.HasPrefix(dataBytes, prefix2) {
+				logrus.Debugf("Invalid data format: %s", string(dataBytes))
+				continue
+			}
+
+			eventCount++
+			payload := dataBytes[6:]
+
+			switch event {
+			case "message_start", "content_block_start", "content_block_stop":
+				logrus.Debugf("Lifecycle event: %s", event)
+
+			case "content_block_delta":
+				var resp MessageResponse
+				if err := json.Unmarshal(payload, &resp); err != nil {
+					logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(payload))
+					continue
+				}
+				var text string
+				if resp.Delta != nil {
+					switch resp.Delta.Type {
+					case "text_delta":
+						text = resp.Delta.Text
+					case "thinking_delta":
+						// thinking 内容单独标记，下游可自行过滤
+						text = resp.Delta.Thinking
+					}
+				}
+				if text != "" {
+					message <- PartialResponse{Text: text, RawData: payload}
+				}
+
+			case "message_delta":
+				logrus.Debug("Message delta received")
+
+			case "message_stop":
+				logrus.Infof("Message completed. Total events: %d", eventCount)
+				resultCh <- scanResult{done: true}
+				return
+
+			case "error":
+				logrus.Errorf("Received error event: %s", string(payload))
+				message <- PartialResponse{Error: fmt.Errorf("server error: %s", string(payload))}
+				resultCh <- scanResult{done: true}
+				return
+
+			case "completion":
+				// 兼容旧版 claude-2 格式
+				var resp webClaude2Response
+				if err := json.Unmarshal(payload, &resp); err != nil {
+					logrus.Errorf("JSON parse error: %v, Raw: %s", err, string(payload))
+					continue
+				}
+				message <- PartialResponse{Text: resp.Completion, RawData: payload}
+				if resp.StopReason == "stop_sequence" {
+					resultCh <- scanResult{done: true}
+					return
+				}
+
+			default:
+				logrus.Warnf("Unknown event type: %s, data: %s", event, string(payload))
+			}
 		}
+	}()
+
+	// 主 goroutine 监听 ctx 取消和扫描结果，两者都能即时响应
+	select {
+	case <-ctx.Done():
+		logrus.Warnf("Context cancelled/timeout. Events processed so far: %d", eventCount)
+		message <- PartialResponse{Error: errors.New("resolve timeout")}
+		// 关闭 response body 触发 scanner goroutine 退出
+		r.Body.Close()
+		// 等待 scanner goroutine 完全退出，防止 goroutine 泄漏
+		for range resultCh {
+		}
+	case <-resultCh:
+		// 扫描正常结束（或在 goroutine 内部已发送错误）
 	}
 }
 
