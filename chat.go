@@ -525,7 +525,7 @@ func (c *Chat) Delete() {
 		return
 	}
 
-	_, err := emit.ClientBuilder(c.session).
+	resp, err := emit.ClientBuilder(c.session).
 		Ja3().
 		CookieJar(c.opts.jar).
 		DELETE(baseURL+"/organizations/"+c.oid+"/chat_conversations/"+c.cid).
@@ -533,13 +533,20 @@ func (c *Chat) Delete() {
 		Header("Referer", "https://claude.ai/chat/"+c.cid).
 		Header("Accept-Language", "en-US,en;q=0.9").
 		Header("user-agent", userAgent).
-		Bytes([]byte(`"`+c.cid+`"`)).
-		DoC(emit.Status(http.StatusOK), emit.IsJSON)
-	// Fix: 删除成功时才清空 cid，避免重复删除或泄漏会话
-	if err == nil {
+		Bytes([]byte(`"` + c.cid + `"`)).
+		Do()
+	// Fix: 同时接受 200 OK 和 204 No Content（claude.ai 实际返回 204）
+	if err == nil && resp != nil &&
+		(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent) {
+		resp.Body.Close()
 		c.cid = ""
 	} else {
-		logrus.Warnf("Delete conversation failed (cid=%s): %v", c.cid, err)
+		if resp != nil {
+			resp.Body.Close()
+			logrus.Warnf("Delete conversation unexpected status (cid=%s): %d", c.cid, resp.StatusCode)
+		} else {
+			logrus.Warnf("Delete conversation failed (cid=%s): %v", c.cid, err)
+		}
 	}
 }
 
@@ -577,27 +584,42 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		return 0, nil, nil
 	})
 
-	// Fix: 将阻塞的 scanner 移到独立 goroutine，使 ctx.Done() 能被及时响应
-	// 而不是只在每两次 Scan() 调用之间才有机会检测到取消信号
-	type scanResult struct {
-		done bool // true 表示本次事件要求终止流
-	}
-	resultCh := make(chan scanResult, 1)
 	eventCount := 0
 
-	// 扫描 goroutine：持续读取 SSE 事件并将结果写入 resultCh
+	// idleTimeout：空闲超时时长。
+	// 与上层传入的 ctx（总时长 deadline）不同，这里只在"连续 N 秒没有收到任何新数据"
+	// 时才判定超时，因此无论回复多长，只要 claude.ai 持续输出就不会被截断。
+	const idleTimeout = 60 * time.Second
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+
+	// pongCh：scanner goroutine 每解析到一个有效事件就往这里发一次信号，
+	// 用于重置空闲计时器
+	type scanSignal struct {
+		done bool
+		err  error
+	}
+	pongCh := make(chan scanSignal, 8)
+
+	// 扫描 goroutine：持续读取 SSE 事件并将结果写入 pongCh
 	go func() {
-		defer close(resultCh)
+		defer close(pongCh)
 		for {
 			// 读 event 行
 			if !scanner.Scan() {
 				if err := scanner.Err(); err != nil {
-					logrus.Errorf("Scanner error after %d events: %v", eventCount, err)
-					message <- PartialResponse{Error: fmt.Errorf("scanner error: %w", err)}
+					// 被主动关闭 body 时会出现 "response body closed"，属于正常中止，不是错误
+					if strings.Contains(err.Error(), "response body closed") ||
+						strings.Contains(err.Error(), "body closed") {
+						logrus.Infof("Scanner stopped (body closed). Events: %d", eventCount)
+					} else {
+						logrus.Errorf("Scanner error after %d events: %v", eventCount, err)
+						pongCh <- scanSignal{done: true, err: fmt.Errorf("scanner error: %w", err)}
+					}
 				} else {
 					logrus.Infof("Scanner EOF. Events processed: %d", eventCount)
 				}
-				resultCh <- scanResult{done: true}
+				pongCh <- scanSignal{done: true}
 				return
 			}
 
@@ -615,7 +637,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 			// 读 data 行
 			if !scanner.Scan() {
 				logrus.Warn("Failed to read data line after event")
-				resultCh <- scanResult{done: true}
+				pongCh <- scanSignal{done: true}
 				return
 			}
 			dataBytes := scanner.Bytes()
@@ -629,6 +651,9 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 
 			eventCount++
 			payload := dataBytes[6:]
+
+			// 每个有效事件都 ping 一次主 goroutine，重置空闲计时器
+			pongCh <- scanSignal{done: false}
 
 			switch event {
 			case "message_start", "content_block_start", "content_block_stop":
@@ -646,7 +671,6 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 					case "text_delta":
 						text = resp.Delta.Text
 					case "thinking_delta":
-						// thinking 内容单独标记，下游可自行过滤
 						text = resp.Delta.Thinking
 					}
 				}
@@ -659,13 +683,13 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 
 			case "message_stop":
 				logrus.Infof("Message completed. Total events: %d", eventCount)
-				resultCh <- scanResult{done: true}
+				pongCh <- scanSignal{done: true}
 				return
 
 			case "error":
 				logrus.Errorf("Received error event: %s", string(payload))
 				message <- PartialResponse{Error: fmt.Errorf("server error: %s", string(payload))}
-				resultCh <- scanResult{done: true}
+				pongCh <- scanSignal{done: true}
 				return
 
 			case "completion":
@@ -677,7 +701,7 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 				}
 				message <- PartialResponse{Text: resp.Completion, RawData: payload}
 				if resp.StopReason == "stop_sequence" {
-					resultCh <- scanResult{done: true}
+					pongCh <- scanSignal{done: true}
 					return
 				}
 
@@ -687,18 +711,46 @@ func (c *Chat) resolve(ctx context.Context, r *http.Response, message chan Parti
 		}
 	}()
 
-	// 主 goroutine 监听 ctx 取消和扫描结果，两者都能即时响应
-	select {
-	case <-ctx.Done():
-		logrus.Warnf("Context cancelled/timeout. Events processed so far: %d", eventCount)
-		message <- PartialResponse{Error: errors.New("resolve timeout")}
-		// 关闭 response body 触发 scanner goroutine 退出
+	// 主 goroutine：同时监听三路信号
+	//   1. ctx.Done()    — 上层传入的总 deadline（兜底，防止永久挂起）
+	//   2. idleTimer     — 空闲超时（N 秒没有新事件则中止）
+	//   3. pongCh        — scanner 正常推进或完成
+	drainScanner := func() {
 		r.Body.Close()
-		// 等待 scanner goroutine 完全退出，防止 goroutine 泄漏
-		for range resultCh {
+		for range pongCh {
 		}
-	case <-resultCh:
-		// 扫描正常结束（或在 goroutine 内部已发送错误）
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Warnf("Total deadline exceeded. Events processed: %d", eventCount)
+			message <- PartialResponse{Error: errors.New("total deadline exceeded")}
+			drainScanner()
+			return
+
+		case <-idleTimer.C:
+			logrus.Warnf("Idle timeout (%s). Events processed: %d", idleTimeout, eventCount)
+			message <- PartialResponse{Error: errors.New("idle timeout: no data received")}
+			drainScanner()
+			return
+
+		case sig, ok := <-pongCh:
+			if !ok || sig.done {
+				// scanner goroutine 已退出
+				if sig.err != nil {
+					message <- PartialResponse{Error: sig.err}
+				}
+				return
+			}
+			// 收到新数据，重置空闲计时器
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idleTimeout)
+		}
 	}
 }
 
